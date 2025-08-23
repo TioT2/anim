@@ -22,6 +22,21 @@ pub struct DeviceContext {
 
     /// Surface handle
     pub surface: vk::SurfaceKHR,
+
+    /// Physical device
+    pub physical_device: vk::PhysicalDevice,
+
+    /// Main queue family index
+    pub queue_family_index: u32,
+
+    /// Device
+    pub device: ash::Device,
+
+    /// Swapchain extension specific device
+    pub device_swapchain: ash::khr::swapchain::Device,
+
+    /// Main queue
+    pub queue: vk::Queue,
 }
 
 macro_rules! bitflags_to_string {
@@ -150,7 +165,7 @@ impl DeviceContext {
                     .to_owned(),
                 layer
             )))
-            .collect::<Result<HashMap<CString, vk::LayerProperties>, CoreInitError>>()
+            .collect()
     }
 
     /// Get extensions available then layer is active
@@ -167,7 +182,24 @@ impl DeviceContext {
                     .to_owned(),
                 ext.spec_version
             )))
-            .collect::<Result<HashMap<CString, u32>, CoreInitError>>()
+            .collect()
+    }
+
+    /// Get device extension set
+    fn get_device_extensions(
+        instance: &ash::Instance,
+        device: vk::PhysicalDevice
+    ) -> Result<HashMap<CString, u32>, CoreInitError> {
+        unsafe { instance.enumerate_device_extension_properties(device) }?
+            .into_iter()
+            .map(|ext| Ok((
+                ext
+                    .extension_name_as_c_str()
+                    .map_err(CoreInitError::InvalidCStr)?
+                    .to_owned(),
+                ext.spec_version
+            )))
+            .collect()
     }
 
     /// Validate required extension and layer sets
@@ -199,13 +231,118 @@ impl DeviceContext {
         Ok(())
     }
 
-    /// Construct new device context
-    pub fn new(
-        window_context: Arc<dyn WindowContext>,
-        applciation_name: Option<&CStr>
-    ) -> Result<Self, CoreInitError> {
-        let entry = unsafe { ash::Entry::load() }.map_err(CoreInitError::EntryLoadingError)?;
+    /// Pick queue that can be used as main
+    fn find_main_queue_family_index(
+        instance: &ash::Instance,
+        instance_surface: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+        physical_device: vk::PhysicalDevice
+    ) -> Result<Option<u32>, CoreInitError> {
+        let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let queue_flags = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER;
 
+        for (index, family) in families.iter().enumerate() {
+            let index = index as u32;
+            if family.queue_flags & queue_flags != queue_flags {
+                continue;
+            }
+
+            let surface_support = unsafe {
+                instance_surface.get_physical_device_surface_support(
+                    physical_device, index, surface)?
+            };
+
+            if !surface_support {
+                continue;
+            }
+
+            return Ok(Some(index));
+        }
+
+        return Ok(None);
+    }
+
+    /// Pick physical device
+    fn pick_physical_device(
+        instance: &ash::Instance,
+        instance_surface: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+        required_extensions: &[CString],
+    ) -> Result<(vk::PhysicalDevice, u32), CoreInitError> {
+        let physical_devices = unsafe { instance.enumerate_physical_devices() }?;
+        let mut best_physial_device = None;
+
+        for physical_device in physical_devices {
+            let surface_formats = unsafe {
+                instance_surface.get_physical_device_surface_formats(physical_device, surface)?
+            };
+
+            let required_format = vk::SurfaceFormatKHR {
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+                format: vk::Format::B8G8R8A8_SRGB,
+            };
+
+            if !surface_formats.contains(&required_format) {
+                continue;
+            }
+
+            let present_modes = unsafe {
+                instance_surface.get_physical_device_surface_present_modes(physical_device, surface)?
+            };
+
+            if !present_modes.contains(&vk::PresentModeKHR::FIFO) {
+                continue;
+            }
+
+            let device_extensions = Self::get_device_extensions(instance, physical_device)?;
+
+            // Skip devices without required extensions
+            if !required_extensions.iter().all(|ext| device_extensions.contains_key(ext)) {
+                continue;
+            }
+
+            let main_queue = Self::find_main_queue_family_index(
+                instance,
+                instance_surface,
+                surface,
+                physical_device
+            )?;
+            let Some(main_queue) = main_queue else {
+                continue;
+            };
+
+            let props = unsafe { instance.get_physical_device_properties(physical_device) };
+            let rate = match props.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => 4,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 3,
+                vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+                _ => 1,
+            };
+
+            // Device descriptor
+            let desc = (rate, physical_device, main_queue);
+
+            let Some((prev_rate, _, _)) = best_physial_device else {
+                best_physial_device = Some(desc);
+                continue;
+            };
+            if rate > prev_rate {
+                best_physial_device = Some(desc);
+            }
+        }
+
+        match best_physial_device {
+            Some((_, device, main_queue)) => Ok((device, main_queue)),
+            None => Err(CoreInitError::SuitablePhysicalDeviceMissing)
+        }
+    }
+
+    fn create_instance(
+        entry: &ash::Entry,
+        application_name: Option<&CStr>,
+        layers: &[CString],
+        extensions: &[CString],
+    ) -> Result<ash::Instance, CoreInitError> {
         let mut debug_messenger_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
             .message_severity(vk::DebugUtilsMessageSeverityFlagsEXT::empty()
                 // | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
@@ -227,9 +364,60 @@ impl DeviceContext {
             .engine_name(c"anim")
             .api_version(vk::API_VERSION_1_2);
 
-        if let Some(application_name) = applciation_name {
+        if let Some(application_name) = application_name {
             app_info = app_info.application_name(application_name);
         }
+
+        let layer_names = layers
+            .iter()
+            .map(|layer| layer.as_ptr())
+            .collect::<Vec<_>>();
+        let extension_names = extensions
+            .iter()
+            .map(|ext| ext.as_ptr())
+            .collect::<Vec<_>>();
+
+        let instance_create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_layer_names(&layer_names)
+            .enabled_extension_names(&extension_names)
+            .push_next(&mut debug_messenger_info);
+
+        Ok(unsafe { entry.create_instance(&instance_create_info, None) }?)
+    }
+
+    /// Create physical device
+    fn create_device(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue_family_index: u32,
+        extensions: &[CString]
+    ) -> Result<ash::Device, CoreInitError> {
+        let extension_names = extensions
+            .iter()
+            .map(|ext| ext.as_ptr())
+            .collect::<Vec<_>>();
+
+        let queue_priorities = [1.0f32];
+        let queue_create_infos = [
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(queue_family_index)
+                .queue_priorities(&queue_priorities)
+        ];
+
+        let device_create_info = vk::DeviceCreateInfo::default()
+            .enabled_extension_names(&extension_names)
+            .queue_create_infos(&queue_create_infos);
+
+        Ok(unsafe { instance.create_device(physical_device, &device_create_info, None) }?)
+    }
+
+    /// Construct new device context
+    pub fn new(
+        window_context: Arc<dyn WindowContext>,
+        applciation_name: Option<&CStr>
+    ) -> Result<Self, CoreInitError> {
+        let entry = unsafe { ash::Entry::load() }.map_err(CoreInitError::EntryLoadingError)?;
 
         let instance_layers = vec! [
             c"VK_LAYER_KHRONOS_validation".to_owned()
@@ -247,30 +435,20 @@ impl DeviceContext {
             &instance_extensions
         )?;
 
-        let instance_layer_names = instance_layers
-            .iter()
-            .map(|layer| layer.as_ptr())
-            .collect::<Vec<_>>();
-        let instance_extension_names = instance_extensions
-            .iter()
-            .map(|ext| ext.as_ptr())
-            .collect::<Vec<_>>();
-
-        let instance_create_info = vk::InstanceCreateInfo::default()
-            .application_info(&app_info)
-            .enabled_layer_names(&instance_layer_names)
-            .enabled_extension_names(&instance_extension_names)
-            .push_next(&mut debug_messenger_info);
-
-        // Create instance and wrap it in Vulkan RAII guard
+        // Create instance and wrap it in RAII guard
         let instance = DropGuard::new(
-            unsafe { entry.create_instance(&instance_create_info, None) }?,
-            |i: &mut ash::Instance| unsafe { i.destroy_instance(None) }
+            Self::create_instance(
+                &entry,
+                applciation_name,
+                &instance_layers,
+                &instance_extensions
+            )?,
+            |i| unsafe { i.destroy_instance(None) }
         );
 
         let instance_surface = ash::khr::surface::Instance::new(&entry, &instance);
 
-        // Create surface and wrap it in Vulkan RAII guard
+        // Create surface
         let surface = DropGuard::new(
             vk::SurfaceKHR::from_raw(window_context
                 .create_surface(instance.handle().as_raw() as usize)
@@ -279,12 +457,40 @@ impl DeviceContext {
             |s: &mut vk::SurfaceKHR| unsafe { instance_surface.destroy_surface(*s, None) }
         );
 
+        let device_extensions = vec! [
+            c"VK_KHR_swapchain".to_owned()
+        ];
+
+        // Pick physical device
+        let (physical_device, queue_family_index) = Self::pick_physical_device(
+            &instance,
+            &instance_surface,
+            *surface,
+            &device_extensions
+        )?;
+
+        // Create device
+        let device = DropGuard::new(
+            Self::create_device(&instance, physical_device, queue_family_index, &device_extensions)?,
+            |d| unsafe { d.destroy_device(None); }
+        );
+
+        let device_swapchain = ash::khr::swapchain::Device::new(&instance, &device);
+
+        // Get queue from device
+        let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+
         Ok(Self {
             wc: window_context,
             entry,
             surface: surface.into_inner(),
             instance: instance.into_inner(),
             instance_surface,
+            physical_device,
+            queue_family_index,
+            device: device.into_inner(),
+            device_swapchain,
+            queue,
         })
     }
 }
@@ -292,6 +498,7 @@ impl DeviceContext {
 impl Drop for DeviceContext {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_device(None);
             self.instance_surface.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }

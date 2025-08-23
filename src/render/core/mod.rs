@@ -33,7 +33,7 @@ pub trait WindowContext {
 /// Render core initialization error
 #[derive(Debug)]
 pub enum CoreInitError {
-    /// ASH entry loading error
+    /// Ash entry loading error
     EntryLoadingError(ash::LoadingError),
 
     /// Vulkan-level error
@@ -47,6 +47,12 @@ pub enum CoreInitError {
 
     /// Instance extension is not present
     InstanceExtensionNotPresent(CString),
+
+    /// Device extension is missing
+    DeviceExtensionNotPresent(CString),
+
+    /// No suitable physical device
+    SuitablePhysicalDeviceMissing,
 
     /// Error happened somewhere in the window context implementation
     WindowContextError(String),
