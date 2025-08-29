@@ -1,13 +1,13 @@
-//! Renderer subsystem implementation file
+//! Renderer animation subsystem implementation file
 
-use std::{ffi::CStr, sync::Arc};
+use std::{cell::RefCell, ffi::CStr, sync::Arc};
 
 pub mod core;
 
 /// Render context structure
 pub struct Render {
     /// Renderer main object
-    _core: Arc<core::Core>,
+    core: Arc<RefCell<core::Core>>,
 }
 
 /// Renderer construction error
@@ -24,10 +24,12 @@ impl Render {
         application_name: Option<&CStr>
     ) -> Result<Self, RenderInitError> {
         let core = core::Core::new(window_context, application_name).map_err(RenderInitError::CoreInitError)?;
-        let core = Arc::new(core);
+        let core = Arc::new(RefCell::new(core));
 
-        Ok(Self {
-            _core: core,
-        })
+        Ok(Self { core })
+    }
+
+    pub fn next_frame(&self) {
+        self.core.borrow_mut().render_frame().unwrap();
     }
 }

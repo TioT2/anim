@@ -30,6 +30,11 @@ impl FVec {
         Self { x, y, z, w }
     }
 
+    /// Construct new fast vector
+    pub fn new3(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z, w: 0.0 }
+    }
+
     /// X vector component
     pub fn x(self) -> f32 { self.x }
 
@@ -41,6 +46,22 @@ impl FVec {
 
     /// W vector component
     pub fn w(self) -> f32 { self.w }
+
+    pub fn dot(self, rhs: Self) -> f32 {
+        self.x * rhs.x + self.y * rhs.y + self.z * rhs.z + self.w * rhs.w
+    }
+
+    pub fn length(self) -> f32 {
+        Self::dot(self, self).sqrt()
+    }
+
+    pub fn normalized(self) -> Self {
+        self * self.length().recip()
+    }
+
+    pub fn normalize(&mut self) {
+        *self *= self.length().recip();
+    }
 }
 
 macro_rules! impl_vec_operator {

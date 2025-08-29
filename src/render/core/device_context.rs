@@ -4,7 +4,7 @@ use std::{collections::HashMap, ffi::{CStr, CString}, sync::Arc};
 
 use ash::vk::{self, Handle};
 
-use crate::render::core::{CoreInitError, WindowContext};
+use crate::render::core::{util::DropGuard, CoreInitError, WindowContext};
 
 /// Constant structure that holds global low-level Vulkan objects, such as instance, device, queue, etc.
 pub struct DeviceContext {
@@ -96,59 +96,6 @@ unsafe extern "system" fn debug_message_handler(
 
     // Follow by Vulkan spec
     false as vk::Bool32
-}
-
-/// Local RAII wrapper for unsafe API objects
-struct DropGuard<I, D: FnOnce(&mut I)> {
-    /// Guarded item
-    item: I,
-
-    /// Drop function
-    drop: Option<D>,
-}
-
-impl<I, D: FnOnce(&mut I)> DropGuard<I, D> {
-    /// Create new drop guard
-    pub fn new(item: I, drop: D) -> Self {
-        Self { item, drop: Some(drop) }
-    }
-
-    /// Convert drop guard into intenral type, drop 'drop' function
-    pub fn into_inner(mut self) -> I {
-        unsafe {
-            let item = std::ptr::read(&self.item);
-
-            // Destroy drop function
-            std::ptr::drop_in_place(&mut self.drop);
-
-            // Do not destroy self, as all of it's fields are already consumed
-            std::mem::forget(self);
-
-            item
-        }
-    }
-}
-
-impl<I, D: FnOnce(&mut I)> std::ops::Deref for DropGuard<I, D> {
-    type Target = I;
-
-    fn deref(&self) -> &Self::Target {
-        &self.item
-    }
-}
-
-impl<I, D: FnOnce(&mut I)> std::ops::DerefMut for DropGuard<I, D> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.item
-    }
-}
-
-impl<I, D: FnOnce(&mut I)> Drop for DropGuard<I, D> {
-    fn drop(&mut self) {
-        if let Some(drop) = self.drop.take() {
-            drop(&mut self.item);
-        }
-    }
 }
 
 impl DeviceContext {
@@ -398,11 +345,11 @@ impl DeviceContext {
             .map(|ext| ext.as_ptr())
             .collect::<Vec<_>>();
 
-        let queue_priorities = [1.0f32];
+        let priority = 1.0;
         let queue_create_infos = [
             vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family_index)
-                .queue_priorities(&queue_priorities)
+                .queue_priorities(std::array::from_ref(&priority))
         ];
 
         let device_create_info = vk::DeviceCreateInfo::default()
@@ -480,6 +427,17 @@ impl DeviceContext {
         // Get queue from device
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
+        // let props = unsafe {
+        //     instance.get_physical_device_format_properties(physical_device, vk::Format::R16G16B16A16_SNORM)
+        // };
+        // println!("properties: ");
+        // // vk::FormatFeatureFlags::SAMPLED_IMAGE;
+        // println!("    usages: {}", bitflags_to_string!(props.buffer_features, " | ",
+        //     vk::FormatFeatureFlags::SAMPLED_IMAGE => "sampled_image",
+        //     vk::FormatFeatureFlags::VERTEX_BUFFER => "vertex_buffer",
+        //     vk::FormatFeatureFlags::COLOR_ATTACHMENT => "color_attachment",
+        // ));
+
         Ok(Self {
             wc: window_context,
             entry,
@@ -495,6 +453,7 @@ impl DeviceContext {
     }
 }
 
+// Device context requires automatical destruction of it's resources
 impl Drop for DeviceContext {
     fn drop(&mut self) {
         unsafe {

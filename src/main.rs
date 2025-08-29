@@ -1,4 +1,4 @@
-use std::{ffi::{CString}, sync::Arc};
+use std::{ffi::CString, sync::Arc};
 
 /// Window newtype to implement render function
 pub struct WindowContext(Arc<sdl2::video::Window>);
@@ -38,7 +38,7 @@ fn main() {
     let window = Arc::new(window);
 
     // Initialize renderer
-    let _render = anim::render::Render::new(
+    let render = anim::render::Render::new(
         Arc::new(WindowContext(window.clone())),
         Some(c"anim")
     ).unwrap();
@@ -67,8 +67,11 @@ fn main() {
             }
         }
 
+        // Render next frame (literally)
+        render.next_frame();
+
         // Force window update
-        _ = window.surface(&event_pump)
-            .and_then(|surface| surface.update_window());
+        // _ = window.surface(&event_pump)
+        //     .and_then(|surface| surface.update_window());
     }
 }
