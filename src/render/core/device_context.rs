@@ -9,10 +9,13 @@ use crate::render::core::{util::DropGuard, CoreInitError, WindowContext};
 /// Constant structure that holds global low-level Vulkan objects, such as instance, device, queue, etc.
 pub struct DeviceContext {
     /// Window context reference
-    pub wc: Arc<dyn WindowContext>,
+    _wc: Arc<dyn WindowContext>,
 
-    /// Instance
-    pub entry: ash::Entry,
+    /// Vulkan entry (must outlive all vulkan structures)
+    _entry: ash::Entry,
+
+    /// Vulkan API version
+    pub _api_version: u32,
 
     /// Vulkan instance
     pub instance: ash::Instance,
@@ -289,6 +292,7 @@ impl DeviceContext {
         application_name: Option<&CStr>,
         layers: &[CString],
         extensions: &[CString],
+        api_version: u32
     ) -> Result<ash::Instance, CoreInitError> {
         let mut debug_messenger_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
             .message_severity(vk::DebugUtilsMessageSeverityFlagsEXT::empty()
@@ -309,7 +313,7 @@ impl DeviceContext {
 
         let mut app_info = vk::ApplicationInfo::default()
             .engine_name(c"anim")
-            .api_version(vk::API_VERSION_1_2);
+            .api_version(api_version);
 
         if let Some(application_name) = application_name {
             app_info = app_info.application_name(application_name);
@@ -382,13 +386,16 @@ impl DeviceContext {
             &instance_extensions
         )?;
 
+        const API_VERSION: u32 = vk::API_VERSION_1_2;
+
         // Create instance and wrap it in RAII guard
         let instance = DropGuard::new(
             Self::create_instance(
                 &entry,
                 applciation_name,
                 &instance_layers,
-                &instance_extensions
+                &instance_extensions,
+                API_VERSION
             )?,
             |i| unsafe { i.destroy_instance(None) }
         );
@@ -439,8 +446,9 @@ impl DeviceContext {
         // ));
 
         Ok(Self {
-            wc: window_context,
-            entry,
+            _wc: window_context,
+            _entry: entry,
+            _api_version: API_VERSION,
             surface: surface.into_inner(),
             instance: instance.into_inner(),
             instance_surface,

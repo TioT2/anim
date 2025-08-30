@@ -3,6 +3,7 @@
 use std::{cell::RefCell, ffi::CStr, sync::Arc};
 
 pub mod core;
+pub mod model_loader;
 
 /// Render context structure
 pub struct Render {
