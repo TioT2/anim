@@ -6,6 +6,38 @@ use ash::vk::{self, Handle};
 
 use crate::render::core::{CoreInitError, DeviceContext};
 
+/// 'Safe' wrapper for vk::SwapchainKHR
+struct SwapchainHandle {
+    /// Device context
+    dc: Arc<DeviceContext>,
+
+    /// Swapchain itself
+    swapchain: vk::SwapchainKHR,
+}
+
+impl SwapchainHandle {
+    /// Create new swapchain handle
+    pub fn new(dc: Arc<DeviceContext>, swapchain: vk::SwapchainKHR) -> Self {
+        Self { dc, swapchain }
+    }
+}
+
+impl std::ops::Deref for SwapchainHandle {
+    type Target = vk::SwapchainKHR;
+
+    fn deref(&self) -> &Self::Target {
+        &self.swapchain
+    }
+}
+
+impl Drop for SwapchainHandle {
+    fn drop(&mut self) {
+        if !self.swapchain.is_null() {
+            unsafe { self.dc.device_swapchain.destroy_swapchain(self.swapchain, None) };
+        }
+    }
+}
+
 /// Frame storage descriptor
 pub struct Swapchain {
     /// Device context reference
@@ -18,7 +50,7 @@ pub struct Swapchain {
     present_mode: vk::PresentModeKHR,
 
     /// Swapchain, actually
-    swapchain: vk::SwapchainKHR,
+    swapchain: Arc<SwapchainHandle>,
 
     /// Extent of the swapchain images
     extent: vk::Extent2D,
@@ -31,6 +63,11 @@ pub struct Swapchain {
 
     /// If true, resize operation is requested.
     resize_request: Cell<bool>,
+}
+
+/// Structure that **must not** be destroyed while image is used
+pub struct SwapchainGuard {
+    _guard: Arc<SwapchainHandle>
 }
 
 impl Swapchain {
@@ -100,7 +137,7 @@ impl Swapchain {
             .composite_alpha(vk::CompositeAlphaFlagsKHR::INHERIT)
             .present_mode(self.present_mode)
             .clipped(self.allow_image_clipping)
-            .old_swapchain(self.swapchain);
+            .old_swapchain(**self.swapchain);
 
         Ok((
             unsafe { self.dc.device_swapchain.create_swapchain(&swapchain_create_info, None)? },
@@ -115,7 +152,7 @@ impl Swapchain {
 
         // Swapchain will be created on the first frame
         Ok(Self {
-            swapchain: vk::SwapchainKHR::null(),
+            swapchain: Arc::new(SwapchainHandle::new(dc.clone(), vk::SwapchainKHR::null())),
             extent: vk::Extent2D::default(),
             images: Vec::new(),
             allow_image_clipping,
@@ -130,27 +167,24 @@ impl Swapchain {
     pub unsafe fn next_image(
         &mut self,
         semaphore: vk::Semaphore
-    ) -> Result<(u32, bool), vk::Result> {
+    ) -> Result<(SwapchainGuard, u32, bool), vk::Result> {
         let resized = self.resize_request.get();
 
         if resized {
             // Recreate swapchain
             let (swapchain, extent) = unsafe { self.create_swapchain()? };
 
-            // Destroy old swapchain
-            unsafe { self.dc.device_swapchain.destroy_swapchain(self.swapchain, None) };
-
             // Update
-            self.swapchain = swapchain;
+            self.swapchain = Arc::new(SwapchainHandle::new(self.dc.clone(), swapchain));
             self.extent = extent;
             self.images = unsafe {
-                self.dc.device_swapchain.get_swapchain_images(self.swapchain)?
+                self.dc.device_swapchain.get_swapchain_images(swapchain)?
             };
         }
 
         let (image_index, resize_request) = unsafe {
             self.dc.device_swapchain.acquire_next_image(
-                self.swapchain,
+                **self.swapchain,
                 u64::MAX,
                 semaphore,
                 vk::Fence::null()
@@ -159,7 +193,11 @@ impl Swapchain {
         // Set resize flag if required
         self.resize_request.set(resize_request);
 
-        Ok((image_index, resized))
+        Ok((
+            SwapchainGuard { _guard: self.swapchain.clone() },
+            image_index,
+            resized
+        ))
     }
 
     /// Get swapchain image set
@@ -184,17 +222,6 @@ impl Swapchain {
 
     /// Get vulkan-level swapchain handle
     pub unsafe fn handle(&self) -> vk::SwapchainKHR {
-        self.swapchain
-    }
-}
-
-// Swapchain wrapper destructor
-impl Drop for Swapchain {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.swapchain.is_null() {
-                self.dc.device_swapchain.destroy_swapchain(self.swapchain, None);
-            }
-        }
+        **self.swapchain
     }
 }

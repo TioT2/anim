@@ -15,7 +15,7 @@ pub struct DeviceContext {
     _entry: ash::Entry,
 
     /// Vulkan API version
-    pub _api_version: u32,
+    pub api_version: u32,
 
     /// Vulkan instance
     pub instance: ash::Instance,
@@ -434,6 +434,7 @@ impl DeviceContext {
         // Get queue from device
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
+        // // Get image properties
         // let props = unsafe {
         //     instance.get_physical_device_format_properties(physical_device, vk::Format::R16G16B16A16_SNORM)
         // };
@@ -448,7 +449,7 @@ impl DeviceContext {
         Ok(Self {
             _wc: window_context,
             _entry: entry,
-            _api_version: API_VERSION,
+            api_version: API_VERSION,
             surface: surface.into_inner(),
             instance: instance.into_inner(),
             instance_surface,

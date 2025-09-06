@@ -245,7 +245,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
                                         index: ni,
                                     })?,
                                 tangent: 0,
-                                meta: 0,
+                                misc: 0,
                             });
 
                             vac.insert(index);
