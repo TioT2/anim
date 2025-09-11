@@ -11,7 +11,7 @@ use std::{
 
 // ANIM imports
 use crate::{
-    math::{self, FVec},
+    math::{self, FMat, FVec},
     render::core::{
         device_context::DeviceContext,
         memory::{Allocator, FlushContext},
@@ -27,6 +27,7 @@ mod util;
 
 /// Fixed vertex format
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct Vertex {
     /// Vertex position
     pub position: math::Mat<f32, 3>,
@@ -40,7 +41,7 @@ pub struct Vertex {
     /// Vertex tangent (octmap, r16g16_snorm)
     pub tangent: u32,
 
-    /// Misc data (tangent sign, ...)
+    /// Misc data (bitangent sign, ...)
     pub misc: u32,
 }
 
@@ -250,6 +251,12 @@ pub struct Core {
     /// Main render pass
     render_pass: vk::RenderPass,
 
+    /// Temp pipeline layout storage
+    pipeline_layout: vk::PipelineLayout,
+
+    /// Temp pipeline storage
+    pipeline: vk::Pipeline,
+
     /// Set of frames
     frames: Vec<FrameContext>,
 }
@@ -284,30 +291,70 @@ impl Core {
     }
 
     /// Create (the) pipeline
-    unsafe fn _create_pipeline(&self) -> Result<(vk::PipelineLayout, vk::Pipeline), vk::Result> {
+    unsafe fn create_pipeline(
+        dc: &DeviceContext,
+        render_pass: vk::RenderPass
+    ) -> Result<(vk::PipelineLayout, vk::Pipeline), vk::Result> {
         let layout = {
-            let push_constant_range = vk::PushConstantRange::default();
+            let push_constant_range = vk::PushConstantRange::default()
+                .offset(0)
+                .size(std::mem::size_of::<FMat>() as u32)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+                ;
 
             let create_info = vk::PipelineLayoutCreateInfo::default()
                 .push_constant_ranges(std::array::from_ref(&push_constant_range))
                 ;
 
             DropGuard::new(
-                unsafe { self.dc.device.create_pipeline_layout(&create_info, None) }?,
-                |l| unsafe { self.dc.device.destroy_pipeline_layout(*l, None) }
+                unsafe { dc.device.create_pipeline_layout(&create_info, None) }?,
+                |l| unsafe { dc.device.destroy_pipeline_layout(*l, None) }
             )
         };
 
-        // Shader loading and compilation is not implemented yet(
-        if true { todo!(); }
+        let shader_modules = {
+            let compile = |main_fn_name: &str, shader_model: &str| {
+                let spirv_bytes = hassle_rs::compile_hlsl(
+                    "static/model.hlsl",
+                    include_str!("static/model.hlsl"),
+                    main_fn_name,
+                    shader_model,
+                    &["-spirv"],
+                    &[]
+                ).unwrap();
 
-        let shader_stages = {
-            let vertex_stage = vk::PipelineShaderStageCreateInfo::default();
-            let fragment_stage = vk::PipelineShaderStageCreateInfo::default();
+                // Repack SPIR-V as bytes into [u32]
+                let spirv = spirv_bytes
+                    .chunks(4)
+                    .map(|v| {
+                        let mut bytes = [0u8; 4];
+                        bytes.copy_from_slice(v);
+                        u32::from_ne_bytes(bytes)
+                    })
+                    .collect::<Vec<u32>>();
+
+                let module_create_info = vk::ShaderModuleCreateInfo::default().code(&spirv);
+
+                let module = unsafe { dc.device.create_shader_module(&module_create_info, None) }?;
+
+                Ok(module)
+            };
+
+            let drop = |m: &mut vk::ShaderModule| unsafe { dc.device.destroy_shader_module(*m, None) };
+
+            DropGuard::zip(
+                DropGuard::new(compile("vs_main", "vs_5_1")?, drop),
+                DropGuard::new(compile("fs_main", "ps_5_1")?, drop)
+            )
+        };
+
+        let stage_create_infos = {
+            let stage = |sm, sn, st| vk::PipelineShaderStageCreateInfo::default()
+                .module(sm).stage(st).name(sn);
 
             [
-                vertex_stage,
-                fragment_stage
+                stage(shader_modules.0, c"vs_main", vk::ShaderStageFlags::VERTEX),
+                stage(shader_modules.1, c"fs_main", vk::ShaderStageFlags::FRAGMENT)
             ]
         };
 
@@ -331,12 +378,15 @@ impl Core {
             ]
         };
 
+        //vs, fs vk::ImageCreateInfo::default()
+        //     .array_layers
+
         let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(std::array::from_ref(&vertex_input_binding_desc))
             .vertex_attribute_descriptions(&vertex_input_attr_descs);
 
         let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .primitive_restart_enable(true)
+            .primitive_restart_enable(false)
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
@@ -345,6 +395,7 @@ impl Core {
             ;
 
         let rasterization_state = vk::PipelineRasterizationStateCreateInfo::default()
+            .line_width(1.0)
             .depth_clamp_enable(false)
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
@@ -375,7 +426,7 @@ impl Core {
             ;
 
         let create_info = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&shader_stages)
+            .stages(&stage_create_infos)
             .vertex_input_state(&vertex_input_state)
             .input_assembly_state(&input_assembly_state)
             // pub p_tessellation_state: *const PipelineTessellationStateCreateInfo<'a>,
@@ -386,12 +437,12 @@ impl Core {
             .color_blend_state(&color_blend_state)
             .dynamic_state(&dynamic_state)
             .layout(*layout)
-            .render_pass(self.render_pass)
+            .render_pass(render_pass)
             .subpass(0)
             ;
 
         let pipeline = unsafe {
-            self.dc.device.create_graphics_pipelines(
+            dc.device.create_graphics_pipelines(
                 vk::PipelineCache::null(),
                 std::array::from_ref(&create_info),
                 None
@@ -433,11 +484,15 @@ impl Core {
 
         let allocator = Arc::new(Allocator::new(dc.clone())?);
 
+        let (pipeline_layout, pipeline) = unsafe { Self::create_pipeline(dc.as_ref(), *render_pass) }?;
+
         Ok(Self {
             frame_command_pool: frame_command_pool.into_inner(),
             render_pass: render_pass.into_inner(),
             buffered_semaphore: Cell::new(acquision_semaphore.into_inner()),
             frames: Vec::new(),
+            pipeline,
+            pipeline_layout,
             allocator,
             swapchain,
             dc,
@@ -814,6 +869,8 @@ impl Drop for Core {
                 self.swapchain.extent(),
                 self.swapchain.image_format(),
             );
+            self.dc.device.destroy_pipeline(self.pipeline, None);
+            self.dc.device.destroy_pipeline_layout(self.pipeline_layout, None);
             self.dc.device.destroy_render_pass(self.render_pass, None);
             self.dc.device.destroy_semaphore(self.buffered_semaphore.get(), None);
             self.dc.device.destroy_command_pool(self.frame_command_pool, None);
