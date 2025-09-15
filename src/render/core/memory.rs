@@ -1,7 +1,7 @@
-//! Memory allocation and implementation file
+//! Memory allocation implementation file
 //!
 //! TODO:
-//! Create synchronize flush operations (?)
+//! Flush operation strict ordering (by maintaining flush_semaphore set)
 
 use std::{cell::{Cell, RefCell}, sync::Arc};
 
@@ -48,11 +48,8 @@ pub struct Allocator {
     /// Ensure that device context is alive
     dc: Arc<DeviceContext>,
 
-    /// Pool of the flush semaphores
-    _flush_semaphores: Arc<RefCell<Vec<vk::Semaphore>>>,
-
     /// Semaphore to await on next flush
-    prev_flush_semaphore: Option<vk::Semaphore>,
+    flush_semaphore: Option<vk::Semaphore>,
 
     /// Set of staging buffers
     staging_buffers: RefCell<Vec<StagingBuffer>>,
@@ -115,8 +112,7 @@ impl Allocator {
             write_command_buffer: Cell::new(write_command_buffer.into_inner()),
             write_command_pool: write_command_pool.into_inner(),
             staging_buffers: RefCell::new(Vec::new()),
-            prev_flush_semaphore: None,
-            _flush_semaphores: Arc::new(RefCell::new(Vec::new())),
+            flush_semaphore: None,
             allocator,
             dc,
         })
@@ -176,7 +172,6 @@ impl Allocator {
         let (buffer, mut allocation) = {
             let alloc_info = vk_mem::AllocationCreateInfo {
                 flags: vk_mem::AllocationCreateFlags::empty()
-                    | vk_mem::AllocationCreateFlags::MAPPED
                     | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
                 required_flags: vk::MemoryPropertyFlags::empty()
                     | vk::MemoryPropertyFlags::HOST_COHERENT
@@ -192,13 +187,14 @@ impl Allocator {
 
             unsafe { self.allocator.create_buffer(&create_info, &alloc_info) }?
         };
-        let info = self.allocator.get_allocation_info(&allocation);
+
+        let mapped_data = unsafe { self.allocator.map_memory(&mut allocation) }?;
 
         // Write data to the staging buffer
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                info.mapped_data as *mut u8,
+                mapped_data as *mut u8,
                 data.len()
             );
         }
@@ -219,7 +215,7 @@ impl Allocator {
     ) -> Result<(), vk::Result> {
         let staging_buffer = unsafe { self.write_staging_buffer(data) }?;
 
-        // Copy from staging buffer to target buffer
+        // Write copy command
         unsafe {
             self.dc.device.cmd_copy_buffer(
                 self.write_command_buffer.get(),
@@ -247,7 +243,7 @@ impl Allocator {
         let staging_buffers = self.staging_buffers.replace(Vec::new());
 
         let dst_stage_mask = vk::PipelineStageFlags::TRANSFER;
-        let (wait_semaphores, wait_dst_stages) = if let Some(flush_semaphore) = self.prev_flush_semaphore.as_ref() {
+        let (wait_semaphores, wait_dst_stages) = if let Some(flush_semaphore) = self.flush_semaphore.as_ref() {
             (
                 std::array::from_ref(flush_semaphore).as_slice(),
                 std::array::from_ref(&dst_stage_mask).as_slice(),

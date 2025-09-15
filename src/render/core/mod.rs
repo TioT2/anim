@@ -4,9 +4,7 @@ use ash::vk;
 
 // STD imports
 use std::{
-    cell::Cell,
-    ffi::{CStr, CString},
-    sync::Arc
+    cell::{Cell, RefCell}, collections::HashSet, ffi::{CStr, CString}, hash::Hash, sync::Arc
 };
 
 // ANIM imports
@@ -25,7 +23,7 @@ mod memory;
 mod swapchain;
 mod util;
 
-/// Fixed vertex format
+/// Standard vertex format
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct Vertex {
@@ -35,10 +33,10 @@ pub struct Vertex {
     /// Vertex texture coordinate
     pub tex_coord: math::Mat<f32, 2>,
 
-    /// Vertex normal (octmap, r16g16_snorm)
+    /// Octmapped vertex normal (r16g16_snorm)
     pub normal: u32,
 
-    /// Vertex tangent (octmap, r16g16_snorm)
+    /// Octmapped vertex tangent (r16g16_snorm)
     pub tangent: u32,
 
     /// Misc data (bitangent sign, ...)
@@ -46,10 +44,12 @@ pub struct Vertex {
 }
 
 impl Vertex {
-    /// Pack vector into octmap
+    /// Pack normal vector
     pub fn pack_direction_octmap(dx: f32, dy: f32, dz: f32) -> u32 {
-        let length = (dx.abs() + dy.abs() + dz.abs()).recip();
-        let (mut x, mut y) = (dx * length, dy * length);
+        // Calculate normalized (by manhattan distance) direction vector
+        let inv_length = (dx.abs() + dy.abs() + dz.abs()).recip();
+        let (mut x, mut y) = (dx * inv_length, dy * inv_length);
+
         if dz.is_sign_negative() {
             (x, y) = (
                 (1.0 - y.abs()) * x.signum(),
@@ -65,8 +65,8 @@ impl Vertex {
         y << 16 | x
     }
 
-    /// Unpack octmapped vector
-    pub fn unpack_direction_octmap(packed: u32) -> FVec {
+    /// Unpack normal vector
+    pub fn unpack_direction_octmap(packed: u32) -> (f32, f32, f32) {
         let (x, y) = (
             ((packed & 0xFFFF) as u16).cast_signed(),
             ((packed >> 16) as u16).cast_signed()
@@ -75,7 +75,8 @@ impl Vertex {
         let (x, y) = ((x as f32) / 32767.0, (y as f32) / 32767.0);
         let z = 1.0 - x.abs() - y.abs();
         let t = (-z).clamp(0.0, 1.0);
-        FVec::new3(x - x.copysign(t), y - y.copysign(t), z).normalized()
+
+        (x - x.copysign(t), y - y.copysign(t), z)
     }
 }
 
@@ -106,13 +107,13 @@ pub struct Mesh {
     buffer: vk::Buffer,
 
     /// Vertex buffer memory region
-    _vertex_span: std::ops::Range<usize>,
+    vertex_span: std::ops::Range<usize>,
 
     /// Index buffer memory region
-    _index_span: std::ops::Range<usize>,
+    index_span: std::ops::Range<usize>,
 
     /// Count of the mesh indices
-    _index_count: usize,
+    index_count: usize,
 }
 
 impl Drop for Mesh {
@@ -121,13 +122,34 @@ impl Drop for Mesh {
     }
 }
 
+/// Arc structure that provides basic functions based on pointer on T (instead of T's value)
+#[derive(Clone)]
+pub struct BlindArc<T>(pub Arc<T>);
+
+impl<T> PartialEq for BlindArc<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T> Eq for BlindArc<T> {}
+
+impl<T> Hash for BlindArc<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(self.0.as_ref() as *const _, state)
+    }
+}
+
 /// Rendered instance representation structure
 pub struct Instance {
     /// Underlying mesh
-    _mesh: Arc<Mesh>,
+    mesh: Arc<Mesh>,
 
     /// Instance transformation matrix
     transform: Cell<math::FMat>,
+
+    /// Structure that holds rendered object set
+    render_set: Arc<RefCell<HashSet<BlindArc<Instance>>>>,
 
     /// Material structure
     _material: Material,
@@ -142,6 +164,16 @@ impl Instance {
     /// Get transform matrix of the mesh instance
     pub fn get_transform(&self) -> math::FMat {
         self.transform.get()
+    }
+
+    /// Enable instance
+    pub fn enable(self: &Arc<Self>) {
+        self.render_set.borrow_mut().insert(BlindArc(self.clone()));
+    }
+
+    /// Disable instance
+    pub fn disable(self: &Arc<Self>) {
+        self.render_set.borrow_mut().remove(&BlindArc(self.clone()));
     }
 }
 
@@ -197,7 +229,7 @@ impl From<vk::Result> for CoreInitError {
     }
 }
 
-/// Representation of the in-flight frame
+/// In-flight frame representation
 #[derive(Default)]
 struct FrameContext {
     /// Frame acquision semaphore (for frame output start)
@@ -229,6 +261,9 @@ struct FrameContext {
 
     /// Swapchain
     swapchain_guard: Option<SwapchainGuard>,
+
+    /// Current frame render set
+    render_set: Vec<Arc<Instance>>,
 }
 
 /// Core object of the renderer
@@ -259,6 +294,12 @@ pub struct Core {
 
     /// Set of frames
     frames: Vec<FrameContext>,
+
+    /// Set of rendered objects
+    render_set: Arc<RefCell<HashSet<BlindArc<Instance>>>>,
+
+    /// View * Projection matrix
+    matrix_view_projection: FMat,
 }
 
 impl Core {
@@ -399,7 +440,7 @@ impl Core {
             .depth_clamp_enable(false)
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::BACK)
+            .cull_mode(vk::CullModeFlags::NONE)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .depth_bias_enable(false);
 
@@ -410,11 +451,15 @@ impl Core {
             .alpha_to_one_enable(false)
             ;
 
-        let target_attachment = vk::PipelineColorBlendAttachmentState::default();
+        let target_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .blend_enable(false)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ZERO);
 
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(std::array::from_ref(&target_attachment))
-            ;
+            .attachments(std::array::from_ref(&target_attachment));
 
         let dynamic_states = [
             vk::DynamicState::SCISSOR,
@@ -491,6 +536,17 @@ impl Core {
             render_pass: render_pass.into_inner(),
             buffered_semaphore: Cell::new(acquision_semaphore.into_inner()),
             frames: Vec::new(),
+            render_set: Arc::new(RefCell::new(HashSet::new())),
+            matrix_view_projection: {
+                let view = FMat::view(
+                    FVec::new3(4.0, 4.0, 4.0),
+                    FVec::new3(0.0, 0.0, 0.0),
+                    FVec::new3(0.0, 1.0, 0.0)
+                );
+                let projection = FMat::projection_frustum_invz(-1.0, 1.0, -1.0, 1.0, 1.0);
+
+                FMat::mul(&projection, &view)
+            },
             pipeline,
             pipeline_layout,
             allocator,
@@ -704,7 +760,7 @@ impl Core {
             )?;
             self.allocator.write_buffer(
                 *buffer,
-                0,
+                vt_buf_size,
                 std::slice::from_raw_parts(indices.as_ptr() as *const u8, ind_buf_size)
             )?;
         }
@@ -716,17 +772,18 @@ impl Core {
             allocator: self.allocator.clone(),
             buffer_allocation: allocation,
             buffer: buffer,
-            _vertex_span: 0..vt_buf_size,
-            _index_span: vt_buf_size..vt_buf_size + ind_buf_size,
-            _index_count: indices.len(),
+            vertex_span: 0..vt_buf_size,
+            index_span: vt_buf_size..vt_buf_size + ind_buf_size,
+            index_count: indices.len(),
         }))
     }
 
     /// Create new instance
     pub fn create_instance(&self, mesh: Arc<Mesh>, material: Material) -> Result<Arc<Instance>, vk::Result> {
         Ok(Arc::new(Instance {
-            _mesh: mesh,
+            mesh,
             _material: material,
+            render_set: self.render_set.clone(),
             transform: Cell::new(math::FMat::identity()),
         }))
     }
@@ -757,6 +814,11 @@ impl Core {
 
         let frame = &mut self.frames[swapchain_image_index as usize];
         frame.frame_acquired_semaphore.swap(&self.buffered_semaphore);
+        frame.render_set = self.render_set
+            .borrow()
+            .iter()
+            .map(|blind| blind.0.clone())
+            .collect();
 
         // Wait for fences and reset'em
         unsafe {
@@ -808,7 +870,100 @@ impl Core {
             )
         };
 
-        // Fill render pass with... nothing!
+        // Bind pipeline
+        unsafe {
+            self.dc.device.cmd_bind_pipeline(
+                frame.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline
+            );
+        }
+
+        unsafe {
+            let extent = self.swapchain.extent();
+
+            let scissor = vk::Rect2D::default().extent(extent);
+            self.dc.device.cmd_set_scissor(frame.command_buffer, 0, std::array::from_ref(&scissor));
+
+            let viewport = vk::Viewport {
+                width: extent.width as f32,
+                height: extent.height as f32,
+                x: 0.0,
+                y: 0.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            self.dc.device.cmd_set_viewport(frame.command_buffer, 0, std::array::from_ref(&viewport));
+        }
+
+        // Render!
+        for instance in &frame.render_set {
+            // let vp = FMat::new([
+            //     [0.53033, 0.40825, 0.00, -0.57735  ],
+            //     [0.00, -0.8165, 0.00, -0.57735     ],
+            //     [-0.53033, 0.40825, 0.00, -0.57735 ],
+            //     [0.00, 0.00, 0.01, 6.9282          ],
+            // ]);
+
+            unsafe {
+                let time = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs_f64();
+                static mut FRAME_COUNT: u32 = 0;
+                static mut LAST_MEASURE: f64 = 0.0;
+
+                FRAME_COUNT += 1;
+                if time - LAST_MEASURE >= 3.0 {
+                    let fps = FRAME_COUNT as f64 / (time - LAST_MEASURE);
+                    LAST_MEASURE = time;
+                    FRAME_COUNT = 0;
+
+                    if fps >= 0.001 {
+                        println!("FPS: {}", fps);
+                    }
+                }
+            }
+
+            // Calculate world-view-projection matrix
+            let world_view_projection = FMat::mul(
+                &self.matrix_view_projection,
+                &instance.transform.get()
+            );
+
+            // Emit draw commands
+            unsafe {
+                self.dc.device.cmd_bind_vertex_buffers(
+                    frame.command_buffer, 0,
+                    &[instance.mesh.buffer],
+                    &[instance.mesh.vertex_span.start as u64]
+                );
+
+                self.dc.device.cmd_bind_index_buffer(
+                    frame.command_buffer,
+                    instance.mesh.buffer,
+                    instance.mesh.index_span.start as u64,
+                    vk::IndexType::UINT32
+                );
+
+                self.dc.device.cmd_push_constants(
+                    frame.command_buffer,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    std::slice::from_raw_parts(
+                        (&world_view_projection as *const FMat) as *const u8,
+                        std::mem::size_of::<FMat>()
+                    )
+                );
+
+                self.dc.device.cmd_draw_indexed(
+                    frame.command_buffer,
+                    instance.mesh.index_count as u32,
+                    1,
+                    0,
+                    0,
+                    0
+                );
+            }
+        }
 
         unsafe {
             self.dc.device.cmd_end_render_pass(frame.command_buffer);

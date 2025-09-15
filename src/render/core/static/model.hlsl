@@ -25,7 +25,7 @@ struct PushConstant {
 VSOut vs_main(Vertex vertex) {
     VSOut result;
 
-    result.position = mul(push_constant.world_view_projection, vertex.position);
+    result.position = mul(push_constant.world_view_projection, float4(vertex.position, 1.0));
     result.color = float3(vertex.normal, 0.0);
 
     return result;

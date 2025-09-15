@@ -43,6 +43,20 @@ fn main() {
         Some(c"anim")
     ).unwrap();
 
+    let instance = {
+        let text = std::fs::read_to_string(".temp/rei.obj").unwrap();
+        let obj = anim::render::model_loader::parse(&text).unwrap();
+        let mesh = render.create_core_mesh(&obj.vertices, &obj.indices);
+
+        render.create_core_instance(mesh, anim::render::core::Material {
+            base_color: [0.30, 0.47, 0.80],
+            metallic: 0.0,
+            roughness: 0.0
+        })
+    };
+
+    instance.enable();
+
     'main_loop: loop {
         'event_loop: while let Some(event) = event_pump.poll_event() {
             type Event = sdl2::event::Event;
@@ -69,9 +83,5 @@ fn main() {
 
         // Render next frame (literally)
         render.next_frame();
-
-        // Force window update
-        // _ = window.surface(&event_pump)
-        //     .and_then(|surface| surface.update_window());
     }
 }

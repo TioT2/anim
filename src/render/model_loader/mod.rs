@@ -167,8 +167,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
 
                 let [x, y] = [x, y].map(str::parse::<f32>);
 
-                let zip = x
-                    .and_then(|x| y.map(|y| (x, y)));
+                let zip = x.and_then(|x| y.map(|y| (x, y)));
 
                 let (x, y) = match zip {
                     Ok(t) => t,
@@ -200,8 +199,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
                 };
 
                 // Normalized input normal and pack it in octmap
-                let normalized = math::FVec::new3(x, y, z).normalized();
-                let packed = Vertex::pack_direction_octmap(normalized.x(), normalized.y(), normalized.z());
+                let packed = Vertex::pack_direction_octmap(x, y, z);
                 normals.push(packed);
             }
 
@@ -262,7 +260,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
                 let ibase = vt_index(wbase)?;
                 let mut icurr = vt_index(wcurr)?;
 
-                // Do not account single-side face?
+                // Single-side faces are not accounted
                 for word in word_vec.iter().skip(3) {
                     let i = vt_index(word)?;
 
