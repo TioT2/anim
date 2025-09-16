@@ -33,5 +33,5 @@ VSOut vs_main(Vertex vertex) {
 
 /// Fragment shader main
 float4 fs_main(VSOut input): SV_TARGET0 {
-    return float4(input.color, 0.0);
+    return float4((input.color + 1.0) / 2.0, 0.0);
 }

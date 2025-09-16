@@ -94,11 +94,11 @@ pub struct Material {
 
 /// Mesh - structure that holds some vertex data
 pub struct Mesh {
-    /// Device context reference
-    _dc: Arc<DeviceContext>,
-
     /// Allocator reference
     allocator: Arc<Allocator>,
+
+    /// Device context holder
+    _dc: Arc<DeviceContext>,
 
     /// Mesh memory allocation
     buffer_allocation: vk_mem::Allocation,
@@ -140,6 +140,61 @@ impl<T> Hash for BlindArc<T> {
     }
 }
 
+// /// Weak arc that provides basic functions on T
+// pub struct BlindWeak<T>(pub std::sync::Weak<T>);
+
+// impl<T> PartialEq for BlindWeak<T> {
+//     fn eq(&self, other: &Self) -> bool {
+//         std::sync::Weak::ptr_eq(&self.0, &other.0)
+//     }
+// }
+
+// impl<T> Eq for BlindWeak<T> {}
+
+// impl<T> Hash for BlindWeak<T> {
+//     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+//         self.0.as_ptr().hash(state)
+//     }
+// }
+
+/// Structure that manages set of rendered objects
+pub struct RenderSet {
+    /// Render set internals
+    data: RefCell<HashSet<BlindArc<Instance>>>,
+}
+
+impl RenderSet {
+    /// Create new render set
+    pub fn new() -> Self {
+        Self {
+            data: RefCell::new(HashSet::new()),
+        }
+    }
+
+    /// Manually insert item to the render set
+    pub fn insert(&self, instance: Arc<Instance>) {
+        self.data.borrow_mut().insert(BlindArc(instance));
+    }
+
+    /// Manually remove item from render set
+    pub fn remove(&self, instance: Arc<Instance>) {
+        self.data.borrow_mut().remove(&BlindArc(instance));
+    }
+
+    /// Remove objects that are not possible to be displayed
+    pub fn collect_garbage(&self) {
+        // self.data.borrow_mut().retain(|b| b.0.strong_count() > 0)
+    }
+
+    /// Take render set snapshot
+    pub fn snapshot(&self) -> Vec<Arc<Instance>> {
+        self.data.borrow()
+            .iter()
+            .map(|bweak| bweak.0.clone())
+            .collect()
+    }
+}
+
 /// Rendered instance representation structure
 pub struct Instance {
     /// Underlying mesh
@@ -148,8 +203,8 @@ pub struct Instance {
     /// Instance transformation matrix
     transform: Cell<math::FMat>,
 
-    /// Structure that holds rendered object set
-    render_set: Arc<RefCell<HashSet<BlindArc<Instance>>>>,
+    /// Render set reference
+    render_set: std::sync::Weak<RenderSet>,
 
     /// Material structure
     _material: Material,
@@ -168,12 +223,18 @@ impl Instance {
 
     /// Enable instance
     pub fn enable(self: &Arc<Self>) {
-        self.render_set.borrow_mut().insert(BlindArc(self.clone()));
+        // Try to get access set
+        if let Some(set) = self.render_set.upgrade() {
+            set.insert(self.clone());
+        }
     }
 
     /// Disable instance
     pub fn disable(self: &Arc<Self>) {
-        self.render_set.borrow_mut().remove(&BlindArc(self.clone()));
+        // Try to get access set
+        if let Some(set) = self.render_set.upgrade() {
+            set.remove(self.clone());
+        }
     }
 }
 
@@ -296,7 +357,7 @@ pub struct Core {
     frames: Vec<FrameContext>,
 
     /// Set of rendered objects
-    render_set: Arc<RefCell<HashSet<BlindArc<Instance>>>>,
+    render_set: Arc<RenderSet>,
 
     /// View * Projection matrix
     matrix_view_projection: FMat,
@@ -419,9 +480,6 @@ impl Core {
             ]
         };
 
-        //vs, fs vk::ImageCreateInfo::default()
-        //     .array_layers
-
         let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(std::array::from_ref(&vertex_input_binding_desc))
             .vertex_attribute_descriptions(&vertex_input_attr_descs);
@@ -536,7 +594,7 @@ impl Core {
             render_pass: render_pass.into_inner(),
             buffered_semaphore: Cell::new(acquision_semaphore.into_inner()),
             frames: Vec::new(),
-            render_set: Arc::new(RefCell::new(HashSet::new())),
+            render_set: Arc::new(RenderSet::new()),
             matrix_view_projection: {
                 let view = FMat::view(
                     FVec::new3(4.0, 4.0, 4.0),
@@ -577,6 +635,7 @@ impl Core {
             })
         );
 
+        // Create views and framebuffers
         for image in swapchain_images {
             let view = {
                 let create_info = vk::ImageViewCreateInfo::default()
@@ -783,7 +842,7 @@ impl Core {
         Ok(Arc::new(Instance {
             mesh,
             _material: material,
-            render_set: self.render_set.clone(),
+            render_set: Arc::downgrade(&self.render_set),
             transform: Cell::new(math::FMat::identity()),
         }))
     }
@@ -814,11 +873,13 @@ impl Core {
 
         let frame = &mut self.frames[swapchain_image_index as usize];
         frame.frame_acquired_semaphore.swap(&self.buffered_semaphore);
-        frame.render_set = self.render_set
-            .borrow()
-            .iter()
-            .map(|blind| blind.0.clone())
-            .collect();
+
+        // Update current render set and take it's snapshot
+        self.render_set.collect_garbage();
+        frame.render_set = self.render_set.snapshot();
+        // external_ref_count
+        // internal_ref_count
+        // weak_ref_count
 
         // Wait for fences and reset'em
         unsafe {
@@ -896,36 +957,34 @@ impl Core {
             self.dc.device.cmd_set_viewport(frame.command_buffer, 0, std::array::from_ref(&viewport));
         }
 
-        // Render!
-        for instance in &frame.render_set {
-            // let vp = FMat::new([
-            //     [0.53033, 0.40825, 0.00, -0.57735  ],
-            //     [0.00, -0.8165, 0.00, -0.57735     ],
-            //     [-0.53033, 0.40825, 0.00, -0.57735 ],
-            //     [0.00, 0.00, 0.01, 6.9282          ],
-            // ]);
+        unsafe {
+            let time = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
 
-            unsafe {
-                let time = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs_f64();
-                static mut FRAME_COUNT: u32 = 0;
-                static mut LAST_MEASURE: f64 = 0.0;
+            static mut FRAME_COUNT: u32 = 0;
+            static mut LAST_MEASURE: f64 = 0.0;
 
-                FRAME_COUNT += 1;
-                if time - LAST_MEASURE >= 3.0 {
-                    let fps = FRAME_COUNT as f64 / (time - LAST_MEASURE);
-                    LAST_MEASURE = time;
-                    FRAME_COUNT = 0;
+            FRAME_COUNT += 1;
+            if time - LAST_MEASURE >= 1.0 {
+                let fps = FRAME_COUNT as f64 / (time - LAST_MEASURE);
+                LAST_MEASURE = time;
+                FRAME_COUNT = 0;
 
-                    if fps >= 0.001 {
-                        println!("FPS: {}", fps);
-                    }
+                if fps >= 0.001 {
+                    println!("FPS: {}", fps);
                 }
             }
+        }
 
+        // Render!
+        for instance in &frame.render_set {
             // Calculate world-view-projection matrix
             let world_view_projection = FMat::mul(
                 &self.matrix_view_projection,
-                &instance.transform.get()
+                // &FMat::translate(FVec::new3(0.0, time.sin() as f32, 0.0)),
+                &instance.transform.get(),
             );
 
             // Emit draw commands
@@ -1014,6 +1073,8 @@ impl Core {
 
 impl Drop for Core {
     fn drop(&mut self) {
+        // Clear render set
+
         unsafe {
             // Wait all device operations finish
             _ = self.dc.device.device_wait_idle();

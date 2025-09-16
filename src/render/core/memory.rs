@@ -1,7 +1,4 @@
 //! Memory allocation implementation file
-//!
-//! TODO:
-//! Flush operation strict ordering (by maintaining flush_semaphore set)
 
 use std::{cell::{Cell, RefCell}, sync::Arc};
 
@@ -23,14 +20,14 @@ struct StagingBuffer {
 /// # Safety
 /// Flush context is drop-safe only after flushed operations completed
 pub struct FlushContext {
-    /// Allocator reference
-    allocator: Arc<Allocator>,
-
     /// Buffer
     staging_buffers: Vec<StagingBuffer>,
 
     /// Command buffer
     command_buffer: vk::CommandBuffer,
+
+    /// Allocator reference
+    allocator: Arc<Allocator>,
 }
 
 impl Drop for FlushContext {
@@ -44,12 +41,17 @@ impl Drop for FlushContext {
 }
 
 /// Object that manages memory allocations and transitions
+/// # Note
+/// Field order **does matter** here, Allocator **must be** dropped before DeviceContext (it may be the last reference)
 pub struct Allocator {
+    /// Underlying allocator
+    allocator: vk_mem::Allocator,
+
     /// Ensure that device context is alive
     dc: Arc<DeviceContext>,
 
     /// Semaphore to await on next flush
-    flush_semaphore: Option<vk::Semaphore>,
+    flush_semaphores: Cell<(vk::Semaphore, vk::Semaphore)>,
 
     /// Set of staging buffers
     staging_buffers: RefCell<Vec<StagingBuffer>>,
@@ -59,9 +61,6 @@ pub struct Allocator {
 
     /// Command buffer used for 'write_*' (host -> device) operation family
     write_command_buffer: Cell<vk::CommandBuffer>,
-
-    /// Underlying allocator
-    allocator: vk_mem::Allocator,
 }
 
 impl Allocator {
@@ -108,11 +107,29 @@ impl Allocator {
             |cb| unsafe { dc.device.free_command_buffers(*write_command_pool, std::array::from_ref(cb)) }
         );
 
+        let flush_semaphores = {
+            let create = || Ok(DropGuard::new(
+                unsafe { dc.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?,
+                |s| unsafe { dc.device.destroy_semaphore(*s, None) }
+            ));
+
+            DropGuard::zip(create()?, create()?)
+        };
+
+        // Perform empty submit to trigger signal operation for wait semaphore
+        unsafe {
+            let submit_info = vk::SubmitInfo::default()
+                .signal_semaphores(std::array::from_ref(&flush_semaphores.1));
+
+            dc.device.queue_submit(dc.queue, std::array::from_ref(&submit_info), vk::Fence::null())?;
+        }
+
+
         Ok(Allocator {
             write_command_buffer: Cell::new(write_command_buffer.into_inner()),
             write_command_pool: write_command_pool.into_inner(),
             staging_buffers: RefCell::new(Vec::new()),
-            flush_semaphore: None,
+            flush_semaphores: Cell::new(flush_semaphores.into_inner()),
             allocator,
             dc,
         })
@@ -242,25 +259,27 @@ impl Allocator {
         );
         let staging_buffers = self.staging_buffers.replace(Vec::new());
 
-        let dst_stage_mask = vk::PipelineStageFlags::TRANSFER;
-        let (wait_semaphores, wait_dst_stages) = if let Some(flush_semaphore) = self.flush_semaphore.as_ref() {
-            (
-                std::array::from_ref(flush_semaphore).as_slice(),
-                std::array::from_ref(&dst_stage_mask).as_slice(),
-            )
-        } else {
-            ([].as_slice(), [].as_slice())
-        };
+        let (trigger_semaphore, wait_semaphore) = self.flush_semaphores.get();
+        // Swap semaphores
+        self.flush_semaphores.set((wait_semaphore, trigger_semaphore));
 
-        let submit = vk::SubmitInfo::default()
-            .wait_semaphores(wait_semaphores)
-            .wait_dst_stage_mask(wait_dst_stages)
+        let dst_stage_mask = vk::PipelineStageFlags::TRANSFER;
+        let signal_semaphores = [transfer_end_semaphore, trigger_semaphore];
+
+        // Describe submit operation
+        let submit_info = vk::SubmitInfo::default()
+            .wait_semaphores(std::array::from_ref(&wait_semaphore))
+            .wait_dst_stage_mask(std::array::from_ref(&dst_stage_mask))
             .command_buffers(std::array::from_ref(&*command_buffer))
-            .signal_semaphores(std::array::from_ref(&transfer_end_semaphore));
+            .signal_semaphores(&signal_semaphores);
 
         // Submit command buffer
         unsafe {
-            self.dc.device.queue_submit(self.dc.queue, std::array::from_ref(&submit), vk::Fence::null())?;
+            self.dc.device.queue_submit(
+                self.dc.queue,
+                std::array::from_ref(&submit_info),
+                vk::Fence::null()
+            )?;
         }
 
         Ok(FlushContext {
@@ -275,6 +294,11 @@ impl Drop for Allocator {
     fn drop(&mut self) {
         unsafe {
             _ = self.dc.device.device_wait_idle();
+
+            let (semaphore1, semaphore2) = self.flush_semaphores.get();
+            self.dc.device.destroy_semaphore(semaphore1, None);
+            self.dc.device.destroy_semaphore(semaphore2, None);
+
             for mut buffer in self.staging_buffers.replace(Vec::new()).into_iter() {
                 self.destroy_buffer(buffer.buffer, &mut buffer.allocation);
             }

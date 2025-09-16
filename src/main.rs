@@ -76,6 +76,16 @@ fn main() {
                         _ => {}
                     }
                 }
+                Event::KeyDown { scancode, .. } => 'key_event: {
+                    let Some(scancode) = scancode else {
+                        break 'key_event;
+                    };
+                    match scancode {
+                        sdl2::keyboard::Scancode::D => instance.disable(),
+                        sdl2::keyboard::Scancode::E => instance.enable(),
+                        _ => {}
+                    }
+                }
                 Event::Quit { .. } => break 'main_loop,
                 _ => {}
             }
@@ -84,4 +94,7 @@ fn main() {
         // Render next frame (literally)
         render.next_frame();
     }
+
+    // Instance **must be** disabled
+    // instance.disable();
 }
