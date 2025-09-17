@@ -17,6 +17,15 @@ impl<I, D: FnOnce(&mut I)> DropGuard<I, D> {
         Self { item, drop: ManuallyDrop::new(drop) }
     }
 
+    // /// Inbox drop function
+    // pub fn box_drop_fn(self) -> DropGuard<I, Box<dyn FnOnce(&mut I)>> where D: 'static {
+    //     let (item, drop) = self.decompose();
+    //     DropGuard {
+    //         item,
+    //         drop: ManuallyDrop::new(Box::new(drop)),
+    //     }
+    // }
+
     /// Zip two drop guards into one
     pub fn zip<I2, D2: FnOnce(&mut I2)>(
         self,
@@ -33,6 +42,28 @@ impl<I, D: FnOnce(&mut I)> DropGuard<I, D> {
             item: (i1, i2)
         }
     }
+
+    /// Zip multiple dropguards with one signature
+    pub fn zip_multiple(iter: impl Iterator<Item = Self>) -> DropGuard<Vec<I>, impl FnOnce(&mut Vec<I>)> {
+        let mut items = Vec::new();
+        let mut destructors = Vec::new();
+
+        for guard in iter {
+            let (i, d) = guard.decompose();
+            items.push(i);
+            destructors.push(d);
+        }
+
+        DropGuard {
+            drop: ManuallyDrop::new(move |values: &mut Vec<I>| {
+                for (mut item, dtor) in std::iter::zip(values.drain(..), destructors.into_iter()) {
+                    dtor(&mut item);
+                }
+            }),
+            item: items,
+        }
+    }
+
 
     /// Decompose drop guard into pieces
     fn decompose(self) -> (I, D) {

@@ -140,23 +140,6 @@ impl<T> Hash for BlindArc<T> {
     }
 }
 
-// /// Weak arc that provides basic functions on T
-// pub struct BlindWeak<T>(pub std::sync::Weak<T>);
-
-// impl<T> PartialEq for BlindWeak<T> {
-//     fn eq(&self, other: &Self) -> bool {
-//         std::sync::Weak::ptr_eq(&self.0, &other.0)
-//     }
-// }
-
-// impl<T> Eq for BlindWeak<T> {}
-
-// impl<T> Hash for BlindWeak<T> {
-//     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-//         self.0.as_ptr().hash(state)
-//     }
-// }
-
 /// Structure that manages set of rendered objects
 pub struct RenderSet {
     /// Render set internals
@@ -547,8 +530,11 @@ pub struct Core {
     /// Temp pipeline layout storage
     pipeline_layout: vk::PipelineLayout,
 
-    /// Temp pipeline storage
-    pipeline: vk::Pipeline,
+    /// Depth-only pipeline
+    depth_pipeline: vk::Pipeline,
+
+    /// Color pipeline
+    color_pipeline: vk::Pipeline,
 
     /// Set of frames
     frames: Vec<FrameContext>,
@@ -593,24 +579,40 @@ impl Core {
             .attachment(1)
             .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
-        let subpass = vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(std::array::from_ref(&target_att_ref))
-            .depth_stencil_attachment(&depth_att_ref)
-        ;
+        let subpasses = [
+            vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .depth_stencil_attachment(&depth_att_ref),
+            vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .color_attachments(std::array::from_ref(&target_att_ref))
+                .depth_stencil_attachment(&depth_att_ref),
+        ];
+
+        let dependencies = [
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(1)
+                .src_stage_mask(vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
+                .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ)
+                // pub dependency_flags: DependencyFlags,
+        ];
 
         let create_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
-            .subpasses(std::array::from_ref(&subpass));
+            .dependencies(&dependencies)
+            .subpasses(&subpasses);
 
         unsafe { dc.device.create_render_pass(&create_info, None) }
     }
 
     /// Create (the) pipeline
-    unsafe fn create_pipeline(
+    unsafe fn create_pipeline_family(
         dc: &DeviceContext,
         render_pass: vk::RenderPass
-    ) -> Result<(vk::PipelineLayout, vk::Pipeline), vk::Result> {
+    ) -> Result<(vk::PipelineLayout, (vk::Pipeline, vk::Pipeline)), vk::Result> {
         let layout = {
             let push_constant_range = vk::PushConstantRange::default()
                 .offset(0)
@@ -658,20 +660,13 @@ impl Core {
 
             let drop = |m: &mut vk::ShaderModule| unsafe { dc.device.destroy_shader_module(*m, None) };
 
-            DropGuard::zip(
-                DropGuard::new(compile("vs_main", "vs_5_1")?, drop),
-                DropGuard::new(compile("fs_main", "ps_5_1")?, drop)
-            )
-        };
+            let guards = [
+                DropGuard::new(compile("vs_main",       "vs_5_1")?, drop),
+                DropGuard::new(compile("fs_main",       "ps_5_1")?, drop),
+                DropGuard::new(compile("vs_depth_main", "vs_5_1")?, drop),
+            ];
 
-        let stage_create_infos = {
-            let stage = |sm, sn, st| vk::PipelineShaderStageCreateInfo::default()
-                .module(sm).stage(st).name(sn);
-
-            [
-                stage(shader_modules.0, c"vs_main", vk::ShaderStageFlags::VERTEX),
-                stage(shader_modules.1, c"fs_main", vk::ShaderStageFlags::FRAGMENT)
-            ]
+            DropGuard::zip_multiple(guards.into_iter())
         };
 
         let vertex_input_binding_desc = vk::VertexInputBindingDescription::default()
@@ -712,11 +707,51 @@ impl Core {
             .depth_clamp_enable(false)
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
+            .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .depth_bias_enable(false);
 
-        let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default()
+        let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+            .sample_shading_enable(false)
+            .alpha_to_coverage_enable(false)
+            .alpha_to_one_enable(false)
+            ;
+
+        let dynamic_states = [
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::VIEWPORT,
+        ];
+
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states)
+            ;
+
+        let base_create_info = vk::GraphicsPipelineCreateInfo::default()
+            // .stages(&color_stage_create_infos)
+            .vertex_input_state(&vertex_input_state)
+            .input_assembly_state(&input_assembly_state)
+            // pub p_tessellation_state: *const PipelineTessellationStateCreateInfo<'a>,
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization_state)
+            .multisample_state(&multisample_state)
+            // .depth_stencil_state(&color_depth_stencil_state)
+            // .color_blend_state(&color_color_blend_state)
+            .dynamic_state(&dynamic_state)
+            .layout(*layout)
+            .render_pass(render_pass)
+            // .subpass(0)
+            ;
+
+        // Construct shader stage create info
+        let make_stage_info = |sm, sn, st| vk::PipelineShaderStageCreateInfo::default()
+            .module(sm).stage(st).name(sn);
+
+        let depth_stage_create_infos = [
+            make_stage_info(shader_modules[2], c"vs_depth_main", vk::ShaderStageFlags::VERTEX),
+        ];
+
+        let depth_depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default()
             // pub flags: PipelineDepthStencilStateCreateFlags,
             .depth_test_enable(true)
             .depth_write_enable(true)
@@ -729,57 +764,71 @@ impl Core {
             // pub max_depth_bounds: f32,
             ;
 
-        let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .sample_shading_enable(false)
-            .alpha_to_coverage_enable(false)
-            .alpha_to_one_enable(false)
-            ;
+        let depth_color_blend_state = vk::PipelineColorBlendStateCreateInfo::default();
 
-        let target_attachment = vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .alpha_blend_op(vk::BlendOp::ADD)
-            .blend_enable(false)
-            .src_color_blend_factor(vk::BlendFactor::ONE)
-            .dst_color_blend_factor(vk::BlendFactor::ZERO);
-
-        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(std::array::from_ref(&target_attachment));
-
-        let dynamic_states = [
-            vk::DynamicState::SCISSOR,
-            vk::DynamicState::VIEWPORT,
-        ];
-
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
-            .dynamic_states(&dynamic_states)
-            ;
-
-        let create_info = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stage_create_infos)
-            .vertex_input_state(&vertex_input_state)
-            .input_assembly_state(&input_assembly_state)
-            // pub p_tessellation_state: *const PipelineTessellationStateCreateInfo<'a>,
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization_state)
-            .multisample_state(&multisample_state)
-            .depth_stencil_state(&depth_stencil_state)
-            .color_blend_state(&color_blend_state)
-            .dynamic_state(&dynamic_state)
-            .layout(*layout)
-            .render_pass(render_pass)
+        let depth_create_info = base_create_info
+            .stages(&depth_stage_create_infos)
+            .depth_stencil_state(&depth_depth_stencil_state)
+            .color_blend_state(&depth_color_blend_state)
             .subpass(0)
             ;
 
-        let pipeline = unsafe {
+        let color_stage_create_infos = [
+            make_stage_info(shader_modules[0], c"vs_main", vk::ShaderStageFlags::VERTEX),
+            make_stage_info(shader_modules[1], c"fs_main", vk::ShaderStageFlags::FRAGMENT),
+        ];
+
+        let color_depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default()
+            // pub flags: PipelineDepthStencilStateCreateFlags,
+            .depth_test_enable(true)
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::EQUAL)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false)
+            // pub front: StencilOpState,
+            // pub back: StencilOpState,
+            // pub min_depth_bounds: f32,
+            // pub max_depth_bounds: f32,
+            ;
+
+        let target_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA);
+
+        let color_color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(std::array::from_ref(&target_attachment));
+
+        let color_create_info = base_create_info
+            .stages(&color_stage_create_infos)
+            .depth_stencil_state(&color_depth_stencil_state)
+            .color_blend_state(&color_color_blend_state)
+            .subpass(1)
+            ;
+
+        let create_infos = [depth_create_info, color_create_info];
+
+        let pipelines_opt = unsafe {
             dc.device.create_graphics_pipelines(
                 vk::PipelineCache::null(),
-                std::array::from_ref(&create_info),
+                &create_infos,
                 None
-            ).map_err(|(_, err)| err)?[0]
+            )
         };
 
-        Ok((layout.into_inner(), pipeline))
+        match pipelines_opt {
+            Ok(pipelines) => {
+                let depth_pipeline = pipelines[0];
+                let color_pipeline = pipelines[1];
+
+                Ok((layout.into_inner(), (depth_pipeline, color_pipeline)))
+            }
+            Err((pipelines, error)) => {
+                for pipeline in pipelines {
+                    unsafe { dc.device.destroy_pipeline(pipeline, None) };
+                }
+
+                Err(error)
+            }
+        }
     }
 
     /// Construct instance
@@ -814,7 +863,10 @@ impl Core {
 
         let allocator = Arc::new(Allocator::new(dc.clone())?);
 
-        let (pipeline_layout, pipeline) = unsafe { Self::create_pipeline(dc.as_ref(), *render_pass) }?;
+        let (pipeline_layout, pipelines) = unsafe {
+            Self::create_pipeline_family(dc.as_ref(), *render_pass)
+        }?;
+        let (depth_pipeline, color_pipeline) = pipelines;
 
         Ok(Self {
             frame_command_pool: frame_command_pool.into_inner(),
@@ -832,7 +884,8 @@ impl Core {
 
                 FMat::mul(&projection, &view)
             },
-            pipeline,
+            depth_pipeline,
+            color_pipeline,
             pipeline_layout,
             allocator,
             swapchain,
@@ -1085,14 +1138,14 @@ impl Core {
             )?;
         }
 
+        // Construct clear values
         let clear_values = {
+            // Construct value
             macro_rules! value {
-                ((color $field: ident $val: expr)) => {
-                    vk::ClearValue {
-                        color: vk::ClearColorValue { $field: $val }
-                    }
+                (color $field: ident $val: expr) => {
+                    vk::ClearValue { color: vk::ClearColorValue { $field: $val } }
                 };
-                ((depth [$d: expr, $s: expr])) => {
+                (depth [$d: expr, $s: expr]) => {
                     vk::ClearValue {
                         depth_stencil: vk::ClearDepthStencilValue {
                             depth: $d,
@@ -1101,14 +1154,10 @@ impl Core {
                     }
                 };
             }
-            macro_rules! clear_values {
-                ($($value: tt)*) => { [$( value!($value) ),*] };
-            }
 
-            // Clojure-ish style)
-            clear_values! [
-                (color float32 [0.30, 0.47, 0.80, 0.0])
-                (depth [0.0, 0])
+            [
+                value!(color float32 [0.30, 0.47, 0.80, 0.0]),
+                value!(depth [0.0, 0]),
             ]
         };
 
@@ -1123,6 +1172,27 @@ impl Core {
         ;
 
         unsafe {
+            let time = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+
+            static mut FRAME_COUNT: u32 = 0;
+            static mut LAST_MEASURE: f64 = 0.0;
+
+            FRAME_COUNT += 1;
+            if time - LAST_MEASURE >= 1.0 {
+                let fps = FRAME_COUNT as f64 / (time - LAST_MEASURE);
+                LAST_MEASURE = time;
+                FRAME_COUNT = 0;
+
+                if fps >= 0.001 {
+                    println!("FPS: {}", fps);
+                }
+            }
+        }
+
+        unsafe {
             self.dc.device.cmd_begin_render_pass(
                 frame.command_buffer,
                 &begin_info,
@@ -1130,12 +1200,12 @@ impl Core {
             )
         };
 
-        // Bind (the) pipeline
+        // Bind pipeline
         unsafe {
             self.dc.device.cmd_bind_pipeline(
                 frame.command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline
+                self.depth_pipeline
             );
         }
 
@@ -1157,25 +1227,84 @@ impl Core {
             self.dc.device.cmd_set_viewport(frame.command_buffer, 0, std::array::from_ref(&viewport));
         }
 
-        unsafe {
-            let time = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64();
+        // Render!
+        for instance in &frame.render_set {
+            // Calculate world-view-projection matrix
+            let world_view_projection = FMat::mul(
+                &self.matrix_view_projection,
+                // &FMat::translate(FVec::new3(0.0, time.sin() as f32, 0.0)),
+                &instance.transform.get(),
+            );
 
-            static mut FRAME_COUNT: u32 = 0;
-            static mut LAST_MEASURE: f64 = 0.0;
+            // Emit draw commands
+            unsafe {
+                self.dc.device.cmd_bind_vertex_buffers(
+                    frame.command_buffer, 0,
+                    &[instance.mesh.buffer],
+                    &[instance.mesh.vertex_span.start as u64]
+                );
 
-            FRAME_COUNT += 1;
-            if time - LAST_MEASURE >= 1.0 {
-                let fps = FRAME_COUNT as f64 / (time - LAST_MEASURE);
-                LAST_MEASURE = time;
-                FRAME_COUNT = 0;
+                self.dc.device.cmd_bind_index_buffer(
+                    frame.command_buffer,
+                    instance.mesh.buffer,
+                    instance.mesh.index_span.start as u64,
+                    vk::IndexType::UINT32
+                );
 
-                if fps >= 0.001 {
-                    println!("FPS: {}", fps);
-                }
+                self.dc.device.cmd_push_constants(
+                    frame.command_buffer,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    std::slice::from_raw_parts(
+                        (&world_view_projection as *const FMat) as *const u8,
+                        std::mem::size_of::<FMat>()
+                    )
+                );
+
+                self.dc.device.cmd_draw_indexed(
+                    frame.command_buffer,
+                    instance.mesh.index_count as u32,
+                    1,
+                    0,
+                    0,
+                    0
+                );
             }
+        }
+
+        unsafe {
+            self.dc.device.cmd_next_subpass(
+                frame.command_buffer,
+                vk::SubpassContents::INLINE
+            );
+        }
+
+        // Bind pipeline
+        unsafe {
+            self.dc.device.cmd_bind_pipeline(
+                frame.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.color_pipeline
+            );
+        }
+
+        // Set scissor and viewport
+        unsafe {
+            let extent = self.swapchain.extent();
+
+            let scissor = vk::Rect2D::default().extent(extent);
+            self.dc.device.cmd_set_scissor(frame.command_buffer, 0, std::array::from_ref(&scissor));
+
+            let viewport = vk::Viewport {
+                width: extent.width as f32,
+                height: extent.height as f32,
+                x: 0.0,
+                y: 0.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            self.dc.device.cmd_set_viewport(frame.command_buffer, 0, std::array::from_ref(&viewport));
         }
 
         // Render!
@@ -1282,7 +1411,8 @@ impl Drop for Core {
             // Destroy frames
             _ = self.resize_frames(0);
 
-            self.dc.device.destroy_pipeline(self.pipeline, None);
+            self.dc.device.destroy_pipeline(self.depth_pipeline, None);
+            self.dc.device.destroy_pipeline(self.color_pipeline, None);
             self.dc.device.destroy_pipeline_layout(self.pipeline_layout, None);
             self.dc.device.destroy_render_pass(self.render_pass, None);
             self.dc.device.destroy_semaphore(self.buffered_semaphore.get(), None);

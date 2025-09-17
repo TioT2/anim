@@ -54,3 +54,8 @@ VSOut vs_main(Vertex vertex) {
 float4 fs_main(VSOut input): SV_TARGET0 {
     return float4((normalize(input.color) + 1.0) / 2.0, 0.0);
 }
+
+/// Depth-only vertex shader main
+float4 vs_depth_main(Vertex vertex): SV_POSITION {
+    return mul(push_constant.world_view_projection, float4(vertex.position, 1.0));
+}
