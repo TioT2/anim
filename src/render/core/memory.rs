@@ -155,9 +155,72 @@ impl Allocator {
     pub unsafe fn destroy_buffer(
         &self,
         buffer: vk::Buffer,
-        mut allocation: &mut vk_mem::Allocation
+        allocation: &mut vk_mem::Allocation
     ) {
-        unsafe { self.allocator.destroy_buffer(buffer, &mut allocation) };
+        unsafe { self.allocator.destroy_buffer(buffer, allocation) };
+    }
+
+    /// Create new raw vulkan image
+    pub unsafe fn _create_image(
+        &self,
+        image_create_info: &vk::ImageCreateInfo,
+        allocation_create_info: &vk_mem::AllocationCreateInfo
+    ) -> Result<(vk::Image, vk_mem::Allocation), vk::Result> {
+        let (image, allocation) = unsafe {
+            self.allocator.create_image(
+                image_create_info,
+                allocation_create_info
+            )?
+        };
+
+        Ok((image, allocation))
+    }
+
+    /// Destroy raw vulkan image
+    pub unsafe fn destroy_image(
+        &self,
+        image: vk::Image,
+        allocation: &mut vk_mem::Allocation
+    ) {
+        unsafe { self.allocator.destroy_image(image, allocation) };
+    }
+
+    /// Write data from host to image
+    pub unsafe fn _write_image(
+        &self,
+        image: vk::Image,
+        current_layout: vk::ImageLayout,
+        regions: &[vk::BufferImageCopy],
+        data: &[u8]
+    ) -> Result<(), vk::Result> {
+        let staging_buffer = unsafe { self.write_staging_buffer(data) }?;
+
+        unsafe {
+            self.dc.device.cmd_copy_buffer_to_image(
+                self.write_command_buffer.get(),
+                staging_buffer,
+                image,
+                current_layout,
+                regions
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Execute barrier on image memory
+    pub unsafe fn _image_memory_barrier(&self, barrier: vk::ImageMemoryBarrier) {
+        unsafe {
+            self.dc.device.cmd_pipeline_barrier(
+                self.write_command_buffer.get(),
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::array::from_ref(&barrier)
+            );
+        }
     }
 
     /// Switch current command buffer to the new one

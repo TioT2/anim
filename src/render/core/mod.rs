@@ -13,7 +13,7 @@ use crate::{
     render::core::{
         device_context::DeviceContext,
         memory::{Allocator, FlushContext},
-        swapchain::{Swapchain, SwapchainGuard},
+        swapchain::{Swapchain, SwapchainHandle},
         util::DropGuard
     }
 };
@@ -181,11 +181,6 @@ impl RenderSet {
         self.data.borrow_mut().remove(&BlindArc(instance));
     }
 
-    /// Remove objects that are not possible to be displayed
-    pub fn collect_garbage(&self) {
-        // self.data.borrow_mut().retain(|b| b.0.strong_count() > 0)
-    }
-
     /// Take render set snapshot
     pub fn snapshot(&self) -> Vec<Arc<Instance>> {
         self.data.borrow()
@@ -203,7 +198,7 @@ pub struct Instance {
     /// Instance transformation matrix
     transform: Cell<math::FMat>,
 
-    /// Render set reference
+    /// Render set (weak) reference
     render_set: std::sync::Weak<RenderSet>,
 
     /// Material structure
@@ -290,6 +285,31 @@ impl From<vk::Result> for CoreInitError {
     }
 }
 
+/// Framebuffer image
+#[derive(Default)]
+struct FramebufferImage {
+    /// Image allocation (may be null)
+    allocation: Option<vk_mem::Allocation>,
+
+    /// Image itself
+    image: vk::Image,
+
+    /// Image view
+    view: vk::ImageView,
+}
+
+/// Framebuffer
+struct Framebuffer {
+    /// Guard of the swapchain structure
+    swapchain_handle: Arc<SwapchainHandle>,
+
+    /// Image
+    swapchain_image: FramebufferImage,
+
+    /// Framebuffer itself
+    framebuffer: vk::Framebuffer,
+}
+
 /// In-flight frame representation
 #[derive(Default)]
 struct FrameContext {
@@ -308,20 +328,11 @@ struct FrameContext {
     /// Command buffer used for frame contents
     command_buffer: vk::CommandBuffer,
 
-    /// Framebuffer
-    framebuffer: vk::Framebuffer,
-
-    /// Swapchain image
-    swapchain_image: vk::Image,
-
-    /// Swapchain image view
-    swapchain_image_view: vk::ImageView,
+    /// New framebuffer structure
+    framebuffer: Option<Framebuffer>,
 
     /// Context of the flush operations
     flush_context: Option<FlushContext>,
-
-    /// Swapchain
-    swapchain_guard: Option<SwapchainGuard>,
 
     /// Current frame render set
     render_set: Vec<Arc<Instance>>,
@@ -613,171 +624,255 @@ impl Core {
         })
     }
 
-    /// Reize frame set to match amount of the swapchain images
-    unsafe fn resize_frames(
-        &mut self,
-        swapchain_images: &[vk::Image],
-        swapchain_extent: vk::Extent2D,
-        swapchain_image_format: vk::Format,
-    ) -> Result<(), vk::Result> {
+    /// Create framebuffer image from some external one
+    unsafe fn create_framebuffer_image_external(
+        &self,
+        image: vk::Image,
+        format: vk::Format,
+        is_depthbuffer: bool,
+    ) -> Result<FramebufferImage, vk::Result> {
+        let create_info = vk::ImageViewCreateInfo::default()
+            .components(vk::ComponentMapping::default())
+            .format(format)
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .subresource_range(vk::ImageSubresourceRange::default()
+                .aspect_mask(if is_depthbuffer { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR })
+                .base_array_layer(0)
+                .base_mip_level(0)
+                .layer_count(1)
+                .level_count(1)
+            )
+            ;
 
-        // Await all frames completion before updating target buffers contents
-        if self.frames.len() != 0 {
-            unsafe { self.dc.device.queue_wait_idle(self.dc.queue)? };
-        }
+        let view = unsafe { self.dc.device.create_image_view(&create_info, None) }?;
 
-        // Create new framebuffer vector
-        let mut new_framebuffers = DropGuard::new(
-            Vec::<FrameContext>::with_capacity(swapchain_images.len()),
-            |resources| resources.drain(..).for_each(|fb| unsafe {
-                self.dc.device.destroy_framebuffer(fb.framebuffer, None);
-                self.dc.device.destroy_image_view(fb.swapchain_image_view, None);
-            })
+        Ok(FramebufferImage {
+            allocation: None,
+            image,
+            view
+        })
+    }
+
+    /// Create completely new framebuffer image
+    unsafe fn _create_framebuffer_image(
+        &self,
+        image_create_info: vk::ImageCreateInfo,
+        is_depthbuffer: bool
+    ) -> Result<FramebufferImage, vk::Result> {
+        let allocation_create_info = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferDevice,
+            ..Default::default()
+        };
+
+        let image_allocation = DropGuard::new(
+            unsafe { self.allocator._create_image(&image_create_info, &allocation_create_info) }?,
+            |(image, allocation)| unsafe { self.allocator.destroy_image(*image, allocation) }
         );
 
-        // Create views and framebuffers
-        for image in swapchain_images {
-            let view = {
-                let create_info = vk::ImageViewCreateInfo::default()
-                    .image(*image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(swapchain_image_format)
-                    .components(vk::ComponentMapping::default())
-                    .subresource_range(vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .base_mip_level(0)
-                        .level_count(1)
-                        .base_array_layer(0)
-                        .layer_count(1)
-                    );
+        let view_create_info = vk::ImageViewCreateInfo::default()
+            // pub flags: ImageViewCreateFlags,
+            .image(image_allocation.0)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(image_create_info.format)
+            // pub components: ComponentMapping,
+            .subresource_range(vk::ImageSubresourceRange::default()
+                .aspect_mask(if is_depthbuffer { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR })
+                .base_array_layer(0)
+                .base_mip_level(0)
+                .layer_count(1)
+                .level_count(1)
+            )
+        ;
 
-                DropGuard::new(
-                    unsafe { self.dc.device.create_image_view(&create_info, None) }?,
-                    |view| unsafe { self.dc.device.destroy_image_view(*view, None); }
-                )
-            };
+        let view = unsafe { self.dc.device.create_image_view(&view_create_info, None) }?;
+        let (image, allocation) = image_allocation.into_inner();
 
-            let fb = {
-                let create_info = vk::FramebufferCreateInfo::default()
-                    .flags(vk::FramebufferCreateFlags::empty())
-                    .render_pass(self.render_pass)
-                    .attachments(std::array::from_ref::<vk::ImageView>(&view))
-                    .width(swapchain_extent.width)
-                    .height(swapchain_extent.height)
-                    .layers(1);
+        Ok(FramebufferImage {
+            allocation: Some(allocation),
+            image,
+            view
+        })
+    }
 
-                DropGuard::new(
-                    unsafe { self.dc.device.create_framebuffer(&create_info, None) }?,
-                    |fb| unsafe { self.dc.device.destroy_framebuffer(*fb, None) }
-                )
-            };
-
-            new_framebuffers.push(FrameContext {
-                swapchain_image: *image,
-                swapchain_image_view: view.into_inner(),
-                framebuffer: fb.into_inner(),
-                ..Default::default()
-            })
+    /// Destroy contents of the framebuffer image
+    unsafe fn destroy_framebuffer_image(&self, image: &mut FramebufferImage) {
+        if let Some(allocation) = image.allocation.as_mut() {
+            unsafe { self.allocator.destroy_image(image.image, allocation) };
         }
+        unsafe { self.dc.device.destroy_image_view(image.view, None) };
+    }
 
-        if self.frames.len() <= swapchain_images.len() {
-            let mut new_frames = DropGuard::new(
-                Vec::<FrameContext>::with_capacity(swapchain_images.len() - self.frames.len()),
-                |fs| fs
-                    .drain(..)
-                    .for_each(|item| unsafe {
-                        self.dc.device.free_command_buffers(
-                            self.frame_command_pool,
-                            std::array::from_ref(&item.command_buffer)
-                        );
-                        self.dc.device.destroy_fence(item.fence, None);
-                        self.dc.device.destroy_semaphore(item.frame_acquired_semaphore.get(), None);
-                        self.dc.device.destroy_semaphore(item.render_finished_semaphore, None);
-                    })
-            );
+    /// Create framebuffer
+    unsafe fn create_framebuffer(
+        &self,
+        image: vk::Image,
+        image_format: vk::Format,
+        swapchain_handle: Arc<SwapchainHandle>,
+        swapchain_extent: vk::Extent2D,
+    ) -> Result<Framebuffer, vk::Result> {
+        let swapchain_image = DropGuard::new(
+            unsafe { self.create_framebuffer_image_external(image, image_format, false) }?,
+            |img| unsafe { self.destroy_framebuffer_image(img) }
+        );
 
-            for _new_frame_index in self.frames.len()..swapchain_images.len() {
-                let command_buffer = {
-                    let alloc_info = vk::CommandBufferAllocateInfo::default()
-                        .command_buffer_count(1)
-                        .command_pool(self.frame_command_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY);
+        let framebuffer = {
+            let create_info = vk::FramebufferCreateInfo::default()
+                .flags(vk::FramebufferCreateFlags::empty())
+                .render_pass(self.render_pass)
+                .attachments(std::array::from_ref(&swapchain_image.view))
+                .width(swapchain_extent.width)
+                .height(swapchain_extent.height)
+                .layers(1);
 
-                    DropGuard::new(
-                        unsafe { self.dc.device.allocate_command_buffers(&alloc_info) }?[0],
-                        |cb| unsafe {
-                            self.dc.device.free_command_buffers(
-                                self.frame_command_pool,
-                                std::array::from_ref(cb)
-                            )
-                        }
-                    )
-                };
+            DropGuard::new(
+                unsafe { self.dc.device.create_framebuffer(&create_info, None) }?,
+                |fb| unsafe { self.dc.device.destroy_framebuffer(*fb, None) }
+            )
+        };
 
-                let make_semaphore = || -> Result<DropGuard<vk::Semaphore, _>, vk::Result> {
-                    Ok(DropGuard::new(
-                        unsafe { self.dc.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?,
-                        |s| unsafe { self.dc.device.destroy_semaphore(*s, None) }
-                    ))
-                };
+        Ok(Framebuffer {
+            swapchain_image: swapchain_image.into_inner(),
+            framebuffer: framebuffer.into_inner(),
+            swapchain_handle,
+        })
+    }
 
-                let frame_acuqired_semaphore = make_semaphore()?;
-                let render_finished_semaphore = make_semaphore()?;
-                let transfer_finished_semaphore = make_semaphore()?;
+    /// Destroy framebuffer
+    unsafe fn destroy_framebuffer(&self, mut fb: Framebuffer) {
+        unsafe { self.destroy_framebuffer_image(&mut fb.swapchain_image) };
+        unsafe { self.dc.device.destroy_framebuffer(fb.framebuffer, None) };
+    }
 
-                let fence = {
-                    let create_info = vk::FenceCreateInfo::default()
-                        .flags(vk::FenceCreateFlags::SIGNALED);
+    /// Create new frame context
+    unsafe fn create_frame_context(&self) -> Result<FrameContext, vk::Result> {
+        let command_buffer = {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_buffer_count(1)
+                .command_pool(self.frame_command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY);
 
-                    DropGuard::new(
-                        unsafe { self.dc.device.create_fence(&create_info, None) }?,
-                        |f| unsafe { self.dc.device.destroy_fence(*f, None) }
-                    )
-                };
-
-                new_frames.push(FrameContext {
-                    command_buffer: command_buffer.into_inner(),
-                    fence: fence.into_inner(),
-                    frame_acquired_semaphore: Cell::new(frame_acuqired_semaphore.into_inner()),
-                    render_finished_semaphore: render_finished_semaphore.into_inner(),
-                    transfer_finished_semaphore: transfer_finished_semaphore.into_inner(),
-                    ..Default::default()
-                })
-            }
-
-            // Append new frames
-            self.frames.append(&mut new_frames);
-        } else {
-            // Remove old frames
-            for frame in self.frames.drain(swapchain_images.len()..) {
-                unsafe {
-                    self.dc.device.destroy_framebuffer(frame.framebuffer, None);
-                    self.dc.device.destroy_image_view(frame.swapchain_image_view, None);
-
+            DropGuard::new(
+                unsafe { self.dc.device.allocate_command_buffers(&alloc_info) }?[0],
+                |cb| unsafe {
                     self.dc.device.free_command_buffers(
                         self.frame_command_pool,
-                        std::array::from_ref(&frame.command_buffer)
-                    );
-
-                    self.dc.device.destroy_fence(frame.fence, None);
-                    self.dc.device.destroy_semaphore(frame.frame_acquired_semaphore.get(), None);
-                    self.dc.device.destroy_semaphore(frame.transfer_finished_semaphore, None);
-                    self.dc.device.destroy_semaphore(frame.render_finished_semaphore, None);
+                        std::array::from_ref(cb)
+                    )
                 }
+            )
+        };
+
+        let create_semaphore = || -> Result<DropGuard<vk::Semaphore, _>, vk::Result> {
+            Ok(DropGuard::new(
+                unsafe { self.dc.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?,
+                |s| unsafe { self.dc.device.destroy_semaphore(*s, None) }
+            ))
+        };
+
+        let frame_acuqired_semaphore = create_semaphore()?;
+        let render_finished_semaphore = create_semaphore()?;
+        let transfer_finished_semaphore = create_semaphore()?;
+
+        let fence = {
+            let create_info = vk::FenceCreateInfo::default()
+                .flags(vk::FenceCreateFlags::SIGNALED);
+
+            DropGuard::new(
+                unsafe { self.dc.device.create_fence(&create_info, None) }?,
+                |f| unsafe { self.dc.device.destroy_fence(*f, None) }
+            )
+        };
+
+        Ok(FrameContext {
+            command_buffer: command_buffer.into_inner(),
+            fence: fence.into_inner(),
+            flush_context: None,
+            frame_acquired_semaphore: Cell::new(frame_acuqired_semaphore.into_inner()),
+            render_finished_semaphore: render_finished_semaphore.into_inner(),
+            transfer_finished_semaphore: transfer_finished_semaphore.into_inner(),
+            framebuffer: None,
+            render_set: Vec::new()
+        })
+    }
+
+    unsafe fn destroy_frame_context(&self, mut frame: FrameContext) {
+        unsafe {
+            if let Some(fb) = frame.framebuffer.take() {
+                self.destroy_framebuffer(fb);
+            }
+
+            self.dc.device.free_command_buffers(
+                self.frame_command_pool,
+                std::array::from_ref(&frame.command_buffer)
+            );
+
+            self.dc.device.destroy_fence(frame.fence, None);
+            self.dc.device.destroy_semaphore(frame.frame_acquired_semaphore.get(), None);
+            self.dc.device.destroy_semaphore(frame.transfer_finished_semaphore, None);
+            self.dc.device.destroy_semaphore(frame.render_finished_semaphore, None);
+        }
+    }
+
+    /// Resize frames to match desired frame amount
+    unsafe fn resize_frames(&mut self, new_amount: usize) -> Result<(), vk::Result> {
+        if self.frames.len() == new_amount {
+            return Ok(());
+        }
+
+        if new_amount > self.frames.len() {
+            // Create new frames
+            let mut new_frames = DropGuard::new(
+                Vec::<FrameContext>::with_capacity(new_amount - self.frames.len()),
+                |frames| frames
+                    .drain(..)
+                    .for_each(|fc| unsafe { self.destroy_frame_context(fc) })
+            );
+            for _ in 0..new_amount - self.frames.len() {
+                new_frames.push(unsafe { self.create_frame_context() }?);
+            }
+
+            self.frames.append(&mut new_frames.into_inner());
+        } else {
+            let frame_destroy_list = self.frames.drain(new_amount..).collect::<Vec<_>>();
+            for frame in frame_destroy_list {
+                unsafe { self.destroy_frame_context(frame) };
             }
         }
 
-        // Assign new framebuffers
-        for (frame, res) in Iterator::zip(self.frames.iter_mut(), new_framebuffers.into_inner().into_iter()) {
-            unsafe {
-                self.dc.device.destroy_framebuffer(frame.framebuffer, None);
-                self.dc.device.destroy_image_view(frame.swapchain_image_view, None);
-            }
+        Ok(())
+    }
 
-            frame.framebuffer = res.framebuffer;
-            frame.swapchain_image = res.swapchain_image;
-            frame.swapchain_image_view = res.swapchain_image_view;
+    /// Update frame context to match swapchain state
+    unsafe fn update_frame_context(
+        &mut self,
+        index: usize,
+        swapchain_handle: Arc<SwapchainHandle>
+    ) -> Result<(), vk::Result> {
+        let mut fb_opt = self.frames[index].framebuffer.take();
+
+        // Perform filter_map
+        if let Some(fb) = fb_opt {
+            fb_opt = if fb.swapchain_handle != swapchain_handle {
+                unsafe { self.destroy_framebuffer(fb) };
+                None
+            } else {
+                Some(fb)
+            };
         }
+
+        // Initialize framebuffer
+        self.frames[index].framebuffer = Some(match fb_opt {
+            Some(fb) => fb,
+            None => unsafe {
+                self.create_framebuffer(
+                    self.swapchain.images()[index],
+                    self.swapchain.image_format(),
+                    swapchain_handle,
+                    self.swapchain.extent()
+                )?
+            }
+        });
 
         Ok(())
     }
@@ -859,41 +954,37 @@ impl Core {
 
             // Resize if required
             if resized {
-                unsafe {
-                    self.resize_frames(
-                        self.swapchain.images().to_owned().as_slice(),
-                        self.swapchain.extent(),
-                        self.swapchain.image_format()
-                    )?;
-                }
+                // device_wait_idle here is required to preserve synchronization here
+                unsafe { self.dc.device.device_wait_idle() }?;
+                unsafe { self.resize_frames(self.swapchain.images().len()) }?;
             }
 
             (guard, index)
         };
 
-        let frame = &mut self.frames[swapchain_image_index as usize];
-        frame.frame_acquired_semaphore.swap(&self.buffered_semaphore);
-
-        // Update current render set and take it's snapshot
-        self.render_set.collect_garbage();
-        frame.render_set = self.render_set.snapshot();
-        // external_ref_count
-        // internal_ref_count
-        // weak_ref_count
-
-        // Wait for fences and reset'em
+        // Wait for frame fences and reset'em
         unsafe {
+            let frame = &self.frames[swapchain_image_index as usize];
             self.dc.device.wait_for_fences(std::array::from_ref(&frame.fence), true, u64::MAX)?;
             self.dc.device.reset_fences(std::array::from_ref(&frame.fence))?;
         }
+
+        // Update frame framebuffer
+        unsafe { self.update_frame_context(swapchain_image_index as usize, swapchain_guard) }?;
+
+        // Get frame and set semaphore
+        let frame = &mut self.frames[swapchain_image_index as usize];
+        frame.frame_acquired_semaphore.swap(&self.buffered_semaphore);
+
+        // Take current render set snapshot
+        frame.render_set = self.render_set.snapshot();
 
         // Replace flush context with the new one
         frame.flush_context.replace(
             self.allocator.clone().flush(frame.transfer_finished_semaphore)?
         );
-        frame.swapchain_guard.replace(swapchain_guard);
 
-        // Reset command buffer used for rendering
+        // Reset rendering command buffer
         unsafe {
             self.dc.device.reset_command_buffer(frame.command_buffer, vk::CommandBufferResetFlags::default())?
         };
@@ -915,7 +1006,7 @@ impl Core {
 
         let begin_info = vk::RenderPassBeginInfo::default()
             .render_pass(self.render_pass)
-            .framebuffer(frame.framebuffer)
+            .framebuffer(frame.framebuffer.as_ref().unwrap().framebuffer)
             .render_area(vk::Rect2D::default()
                 .offset(vk::Offset2D::default())
                 .extent(self.swapchain.extent())
@@ -931,7 +1022,7 @@ impl Core {
             )
         };
 
-        // Bind pipeline
+        // Bind (the) pipeline
         unsafe {
             self.dc.device.cmd_bind_pipeline(
                 frame.command_buffer,
@@ -940,6 +1031,7 @@ impl Core {
             );
         }
 
+        // Set scissor and viewport
         unsafe {
             let extent = self.swapchain.extent();
 
@@ -1055,13 +1147,13 @@ impl Core {
             )?;
         }
 
-        let swapchain_handle = unsafe { self.swapchain.handle() };
+        let vulkan_swapchain = unsafe { self.swapchain.handle() };
         let mut present_result = vk::Result::default();
 
         let present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(std::array::from_ref(&frame.render_finished_semaphore))
             .image_indices(std::array::from_ref(&swapchain_image_index))
-            .swapchains(std::array::from_ref(&swapchain_handle))
+            .swapchains(std::array::from_ref(&vulkan_swapchain))
             .results(std::array::from_mut(&mut present_result));
 
         // Present and check for success
@@ -1079,12 +1171,9 @@ impl Drop for Core {
             // Wait all device operations finish
             _ = self.dc.device.device_wait_idle();
 
-            // Destroy all vulkan data
-            _ = self.resize_frames(
-                &[],
-                self.swapchain.extent(),
-                self.swapchain.image_format(),
-            );
+            // Destroy frames
+            _ = self.resize_frames(0);
+
             self.dc.device.destroy_pipeline(self.pipeline, None);
             self.dc.device.destroy_pipeline_layout(self.pipeline_layout, None);
             self.dc.device.destroy_render_pass(self.render_pass, None);

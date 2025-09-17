@@ -7,18 +7,35 @@ use ash::vk::{self, Handle};
 use crate::render::core::{CoreInitError, DeviceContext};
 
 /// 'Safe' wrapper for vk::SwapchainKHR
-struct SwapchainHandle {
+pub struct SwapchainHandle {
     /// Device context
     dc: Arc<DeviceContext>,
 
     /// Swapchain itself
     swapchain: vk::SwapchainKHR,
+
+    /// Swapchain revision
+    revision: u32,
+}
+
+impl PartialEq for SwapchainHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision
+    }
+}
+
+impl Eq for SwapchainHandle {
+
 }
 
 impl SwapchainHandle {
     /// Create new swapchain handle
-    pub fn new(dc: Arc<DeviceContext>, swapchain: vk::SwapchainKHR) -> Self {
-        Self { dc, swapchain }
+    pub fn new(
+        dc: Arc<DeviceContext>,
+        swapchain: vk::SwapchainKHR,
+        revision: u32
+    ) -> Self {
+        Self { dc, swapchain, revision }
     }
 }
 
@@ -63,11 +80,6 @@ pub struct Swapchain {
 
     /// If true, resize operation is requested.
     resize_request: Cell<bool>,
-}
-
-/// Structure that **must not** be destroyed while image is used
-pub struct SwapchainGuard {
-    _guard: Arc<SwapchainHandle>
 }
 
 impl Swapchain {
@@ -152,7 +164,7 @@ impl Swapchain {
 
         // Swapchain will be created on the first frame
         Ok(Self {
-            swapchain: Arc::new(SwapchainHandle::new(dc.clone(), vk::SwapchainKHR::null())),
+            swapchain: Arc::new(SwapchainHandle::new(dc.clone(), vk::SwapchainKHR::null(), 0)),
             extent: vk::Extent2D::default(),
             images: Vec::new(),
             allow_image_clipping,
@@ -167,7 +179,7 @@ impl Swapchain {
     pub unsafe fn next_image(
         &mut self,
         semaphore: vk::Semaphore
-    ) -> Result<(SwapchainGuard, u32, bool), vk::Result> {
+    ) -> Result<(Arc<SwapchainHandle>, u32, bool), vk::Result> {
         let resized = self.resize_request.get();
 
         if resized {
@@ -175,7 +187,11 @@ impl Swapchain {
             let (swapchain, extent) = unsafe { self.create_swapchain()? };
 
             // Update
-            self.swapchain = Arc::new(SwapchainHandle::new(self.dc.clone(), swapchain));
+            self.swapchain = Arc::new(SwapchainHandle::new(
+                self.dc.clone(),
+                swapchain,
+                self.swapchain.revision + 1
+            ));
             self.extent = extent;
             self.images = unsafe {
                 self.dc.device_swapchain.get_swapchain_images(swapchain)?
@@ -194,7 +210,7 @@ impl Swapchain {
         self.resize_request.set(resize_request);
 
         Ok((
-            SwapchainGuard { _guard: self.swapchain.clone() },
+            self.swapchain.clone(),
             image_index,
             resized
         ))
