@@ -306,6 +306,9 @@ struct Framebuffer {
     /// Image
     swapchain_image: FramebufferImage,
 
+    /// Depth buffer
+    depth_image: FramebufferImage,
+
     /// Framebuffer itself
     framebuffer: vk::Framebuffer,
 }
@@ -387,17 +390,34 @@ impl Core {
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+        let depth_attachment = vk::AttachmentDescription::default()
+            // pub flags: AttachmentDescriptionFlags,
+            .format(vk::Format::D32_SFLOAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        let attachments = [target_attachment, depth_attachment];
 
         let target_att_ref = vk::AttachmentReference::default()
             .attachment(0)
             .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
 
+        let depth_att_ref = vk::AttachmentReference::default()
+            .attachment(1)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
         let subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(std::array::from_ref(&target_att_ref));
+            .color_attachments(std::array::from_ref(&target_att_ref))
+            .depth_stencil_attachment(&depth_att_ref)
+        ;
 
         let create_info = vk::RenderPassCreateInfo::default()
-            .attachments(std::array::from_ref(&target_attachment))
+            .attachments(&attachments)
             .subpasses(std::array::from_ref(&subpass));
 
         unsafe { dc.device.create_render_pass(&create_info, None) }
@@ -513,6 +533,19 @@ impl Core {
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .depth_bias_enable(false);
 
+        let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default()
+            // pub flags: PipelineDepthStencilStateCreateFlags,
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::GREATER)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false)
+            // pub front: StencilOpState,
+            // pub back: StencilOpState,
+            // pub min_depth_bounds: f32,
+            // pub max_depth_bounds: f32,
+            ;
+
         let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1)
             .sample_shading_enable(false)
@@ -547,7 +580,7 @@ impl Core {
             .viewport_state(&viewport_state)
             .rasterization_state(&rasterization_state)
             .multisample_state(&multisample_state)
-            // pub p_depth_stencil_state: *const PipelineDepthStencilStateCreateInfo<'a>,
+            .depth_stencil_state(&depth_stencil_state)
             .color_blend_state(&color_blend_state)
             .dynamic_state(&dynamic_state)
             .layout(*layout)
@@ -655,7 +688,7 @@ impl Core {
     }
 
     /// Create completely new framebuffer image
-    unsafe fn _create_framebuffer_image(
+    unsafe fn create_framebuffer_image(
         &self,
         image_create_info: vk::ImageCreateInfo,
         is_depthbuffer: bool
@@ -680,8 +713,8 @@ impl Core {
                 .aspect_mask(if is_depthbuffer { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR })
                 .base_array_layer(0)
                 .base_mip_level(0)
-                .layer_count(1)
-                .level_count(1)
+                .layer_count(image_create_info.array_layers)
+                .level_count(image_create_info.mip_levels)
             )
         ;
 
@@ -716,11 +749,40 @@ impl Core {
             |img| unsafe { self.destroy_framebuffer_image(img) }
         );
 
+        let depth_image = {
+            let create_info = vk::ImageCreateInfo::default()
+                // pub flags: ImageCreateFlags,
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT)
+                .extent(vk::Extent3D {
+                    width: swapchain_extent.width,
+                    height: swapchain_extent.height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                // pub queue_family_index_count: u32,
+                // pub p_queue_family_indices: *const u32,
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                ;
+
+            DropGuard::new(
+                unsafe { self.create_framebuffer_image(create_info, true) }?,
+                |img| unsafe { self.destroy_framebuffer_image(img); }
+            )
+        };
+
         let framebuffer = {
+            let attachments = [swapchain_image.view, depth_image.view];
+
             let create_info = vk::FramebufferCreateInfo::default()
                 .flags(vk::FramebufferCreateFlags::empty())
                 .render_pass(self.render_pass)
-                .attachments(std::array::from_ref(&swapchain_image.view))
+                .attachments(&attachments)
                 .width(swapchain_extent.width)
                 .height(swapchain_extent.height)
                 .layers(1);
@@ -733,6 +795,7 @@ impl Core {
 
         Ok(Framebuffer {
             swapchain_image: swapchain_image.into_inner(),
+            depth_image: depth_image.into_inner(),
             framebuffer: framebuffer.into_inner(),
             swapchain_handle,
         })
@@ -740,8 +803,11 @@ impl Core {
 
     /// Destroy framebuffer
     unsafe fn destroy_framebuffer(&self, mut fb: Framebuffer) {
-        unsafe { self.destroy_framebuffer_image(&mut fb.swapchain_image) };
-        unsafe { self.dc.device.destroy_framebuffer(fb.framebuffer, None) };
+        unsafe {
+            self.destroy_framebuffer_image(&mut fb.swapchain_image);
+            self.destroy_framebuffer_image(&mut fb.depth_image);
+            self.dc.device.destroy_framebuffer(fb.framebuffer, None);
+        }
     }
 
     /// Create new frame context
@@ -998,10 +1064,31 @@ impl Core {
             )?;
         }
 
-        let clear_value = vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.30, 0.47, 0.80, 0.0],
+        let clear_values = {
+            macro_rules! value {
+                ((color $field: ident $val: expr)) => {
+                    vk::ClearValue {
+                        color: vk::ClearColorValue { $field: $val }
+                    }
+                };
+                ((depth [$d: expr, $s: expr])) => {
+                    vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue {
+                            depth: $d,
+                            stencil: $s,
+                        }
+                    }
+                };
             }
+            macro_rules! clear_values {
+                ($($value: tt)*) => { [$( value!($value) ),*] };
+            }
+
+            // Clojure-ish style)
+            clear_values! [
+                (color float32 [0.30, 0.47, 0.80, 0.0])
+                (depth [0.0, 0])
+            ]
         };
 
         let begin_info = vk::RenderPassBeginInfo::default()
@@ -1011,7 +1098,7 @@ impl Core {
                 .offset(vk::Offset2D::default())
                 .extent(self.swapchain.extent())
             )
-            .clear_values(std::array::from_ref(&clear_value))
+            .clear_values(&clear_values)
         ;
 
         unsafe {

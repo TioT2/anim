@@ -66,14 +66,14 @@ pub struct Swapchain {
     /// Presentation mode
     present_mode: vk::PresentModeKHR,
 
+    /// Is image clipping allowed or not
+    allow_image_clipping: bool,
+
     /// Swapchain, actually
     swapchain: Arc<SwapchainHandle>,
 
     /// Extent of the swapchain images
     extent: vk::Extent2D,
-
-    /// Is image clipping allowed or not
-    allow_image_clipping: bool,
 
     /// Set of the swapchain images
     images: Vec<vk::Image>,
