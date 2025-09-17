@@ -161,7 +161,7 @@ impl Allocator {
     }
 
     /// Create new raw vulkan image
-    pub unsafe fn _create_image(
+    pub unsafe fn create_image(
         &self,
         image_create_info: &vk::ImageCreateInfo,
         allocation_create_info: &vk_mem::AllocationCreateInfo

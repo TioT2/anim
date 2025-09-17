@@ -16,6 +16,12 @@ pub struct SwapchainHandle {
 
     /// Swapchain revision
     revision: u32,
+
+    /// Swapchain extent
+    extent: vk::Extent2D,
+
+    /// Image set
+    images: Box<[vk::Image]>,
 }
 
 impl PartialEq for SwapchainHandle {
@@ -29,13 +35,14 @@ impl Eq for SwapchainHandle {
 }
 
 impl SwapchainHandle {
-    /// Create new swapchain handle
-    pub fn new(
-        dc: Arc<DeviceContext>,
-        swapchain: vk::SwapchainKHR,
-        revision: u32
-    ) -> Self {
-        Self { dc, swapchain, revision }
+    /// Get image array
+    pub unsafe fn images(&self) -> &[vk::Image] {
+        &self.images
+    }
+
+    /// Swapchain extent
+    pub const fn extent(&self) -> vk::Extent2D {
+        self.extent
     }
 }
 
@@ -71,12 +78,6 @@ pub struct Swapchain {
 
     /// Swapchain, actually
     swapchain: Arc<SwapchainHandle>,
-
-    /// Extent of the swapchain images
-    extent: vk::Extent2D,
-
-    /// Set of the swapchain images
-    images: Vec<vk::Image>,
 
     /// If true, resize operation is requested.
     resize_request: Cell<bool>,
@@ -121,7 +122,7 @@ impl Swapchain {
     }
 
     /// Create swapchain
-    unsafe fn create_swapchain(&self) -> Result<(vk::SwapchainKHR, vk::Extent2D), vk::Result> {
+    unsafe fn create_swapchain(&self, revision: u32) -> Result<Arc<SwapchainHandle>, vk::Result> {
         let surface_caps = unsafe {
             self.dc.instance_surface.get_physical_device_surface_capabilities(
                 self.dc.physical_device,
@@ -151,10 +152,18 @@ impl Swapchain {
             .clipped(self.allow_image_clipping)
             .old_swapchain(**self.swapchain);
 
-        Ok((
-            unsafe { self.dc.device_swapchain.create_swapchain(&swapchain_create_info, None)? },
-            surface_caps.current_extent
-        ))
+        let swapchain = unsafe { self.dc.device_swapchain.create_swapchain(&swapchain_create_info, None)? };
+        let images = unsafe { self.dc.device_swapchain.get_swapchain_images(swapchain) }?;
+
+        let handle = SwapchainHandle {
+            dc: self.dc.clone(),
+            swapchain: swapchain,
+            revision,
+            extent: surface_caps.current_extent,
+            images: images.into_boxed_slice(),
+        };
+
+        Ok(Arc::new(handle))
     }
 
     /// Create new swapchain
@@ -164,9 +173,13 @@ impl Swapchain {
 
         // Swapchain will be created on the first frame
         Ok(Self {
-            swapchain: Arc::new(SwapchainHandle::new(dc.clone(), vk::SwapchainKHR::null(), 0)),
-            extent: vk::Extent2D::default(),
-            images: Vec::new(),
+            swapchain: Arc::new(SwapchainHandle {
+                dc: dc.clone(),
+                swapchain: vk::SwapchainKHR::null(),
+                revision: 0,
+                extent: vk::Extent2D::default(),
+                images: Box::new([]),
+            }),
             allow_image_clipping,
             surface_format,
             present_mode,
@@ -184,18 +197,7 @@ impl Swapchain {
 
         if resized {
             // Recreate swapchain
-            let (swapchain, extent) = unsafe { self.create_swapchain()? };
-
-            // Update
-            self.swapchain = Arc::new(SwapchainHandle::new(
-                self.dc.clone(),
-                swapchain,
-                self.swapchain.revision + 1
-            ));
-            self.extent = extent;
-            self.images = unsafe {
-                self.dc.device_swapchain.get_swapchain_images(swapchain)?
-            };
+            self.swapchain = unsafe { self.create_swapchain(self.swapchain.revision + 1) }?;
         }
 
         let (image_index, resize_request) = unsafe {
@@ -218,22 +220,22 @@ impl Swapchain {
 
     /// Get swapchain image set
     pub unsafe fn images(&self) -> &[vk::Image] {
-        &self.images
+        &self.swapchain.images
     }
 
     /// Format of the swapchain images
-    pub const fn image_format(&self) -> vk::Format {
+    pub fn image_format(&self) -> vk::Format {
         self.surface_format.format
     }
 
     /// Get image extent
-    pub const fn extent(&self) -> vk::Extent2D {
-        self.extent
+    pub fn extent(&self) -> vk::Extent2D {
+        self.swapchain.extent
     }
 
     /// Count of images
-    pub const fn image_count(&self) -> usize {
-        self.images.len()
+    pub fn image_count(&self) -> usize {
+        self.swapchain.images.len()
     }
 
     /// Get vulkan-level swapchain handle

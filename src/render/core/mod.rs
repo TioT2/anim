@@ -4,7 +4,7 @@ use ash::vk;
 
 // STD imports
 use std::{
-    cell::{Cell, RefCell}, collections::HashSet, ffi::{CStr, CString}, hash::Hash, sync::Arc
+    cell::{Cell, RefCell}, collections::HashSet, ffi::{CStr, CString}, hash::Hash, ops::Deref, sync::Arc
 };
 
 // ANIM imports
@@ -298,19 +298,202 @@ struct FramebufferImage {
     view: vk::ImageView,
 }
 
-/// Framebuffer
+/// Standalone framebuffer implementation
 struct Framebuffer {
-    /// Guard of the swapchain structure
+    /// Device context
+    dc: Arc<DeviceContext>,
+
+    /// Memory allocator
+    allocator: Arc<Allocator>,
+
+    /// Handle of the swapchain
     swapchain_handle: Arc<SwapchainHandle>,
 
-    /// Image
+    /// Swapchain image
     swapchain_image: FramebufferImage,
 
-    /// Depth buffer
+    /// Depthbuffer image
     depth_image: FramebufferImage,
 
     /// Framebuffer itself
     framebuffer: vk::Framebuffer,
+}
+
+impl Framebuffer {
+    /// Allocate image for fb
+    unsafe fn create_framebuffer_image(
+        dc: &DeviceContext,
+        allocator: &Allocator,
+        image_create_info: vk::ImageCreateInfo,
+        is_depthbuffer: bool
+    ) -> Result<FramebufferImage, vk::Result> {
+        let allocation_create_info = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferDevice,
+            ..Default::default()
+        };
+
+        let image_allocation = DropGuard::new(
+            unsafe { allocator.create_image(&image_create_info, &allocation_create_info) }?,
+            |(image, allocation)| unsafe { allocator.destroy_image(*image, allocation) }
+        );
+
+        let view_create_info = vk::ImageViewCreateInfo::default()
+            // pub flags: ImageViewCreateFlags,
+            .image(image_allocation.0)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(image_create_info.format)
+            // pub components: ComponentMapping,
+            .subresource_range(vk::ImageSubresourceRange::default()
+                .aspect_mask(if is_depthbuffer { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR })
+                .base_array_layer(0)
+                .base_mip_level(0)
+                .layer_count(image_create_info.array_layers)
+                .level_count(image_create_info.mip_levels)
+            )
+        ;
+
+        let view = unsafe { dc.device.create_image_view(&view_create_info, None) }?;
+        let (image, allocation) = image_allocation.into_inner();
+
+        Ok(FramebufferImage {
+            allocation: Some(allocation),
+            image,
+            view
+        })
+    }
+
+    /// Create fb image from pre-created image
+    unsafe fn create_framebuffer_image_external(
+        dc: &DeviceContext,
+        image: vk::Image,
+        format: vk::Format,
+        is_depthbuffer: bool,
+    ) -> Result<FramebufferImage, vk::Result> {
+        let create_info = vk::ImageViewCreateInfo::default()
+            .components(vk::ComponentMapping::default())
+            .format(format)
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .subresource_range(vk::ImageSubresourceRange::default()
+                .aspect_mask(if is_depthbuffer { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR })
+                .base_array_layer(0)
+                .base_mip_level(0)
+                .layer_count(1)
+                .level_count(1)
+            )
+            ;
+
+        let view = unsafe { dc.device.create_image_view(&create_info, None) }?;
+
+        Ok(FramebufferImage {
+            allocation: None,
+            image,
+            view
+        })
+    }
+
+    /// Destroy fb image
+    unsafe fn destroy_framebuffer_image(
+        dc: &DeviceContext,
+        allocator: &Allocator,
+        image: &mut FramebufferImage
+    ) {
+        if let Some(allocation) = image.allocation.as_mut() {
+            unsafe { allocator.destroy_image(image.image, allocation) };
+        }
+        unsafe { dc.device.destroy_image_view(image.view, None) };
+    }
+
+    /// Create new framebuffer
+    pub unsafe fn new(
+        dc: Arc<DeviceContext>,
+        allocator: Arc<Allocator>,
+        render_pass: vk::RenderPass,
+        swapchain_image_format: vk::Format,
+        swapchain_image_index: usize,
+        swapchain_handle: Arc<SwapchainHandle>,
+    ) -> Result<Self, vk::Result> {
+        let swapchain_extent = swapchain_handle.extent();
+        let destroy_image = |img: &mut FramebufferImage| unsafe {
+            Self::destroy_framebuffer_image(dc.as_ref(), allocator.as_ref(), img)
+        };
+
+        let swapchain_image = DropGuard::new(
+            unsafe { Self::create_framebuffer_image_external(
+                dc.as_ref(),
+                swapchain_handle.images()[swapchain_image_index],
+                swapchain_image_format,
+                false
+            ) }?,
+            destroy_image
+        );
+
+        let depth_image = {
+            let create_info = vk::ImageCreateInfo::default()
+                // pub flags: ImageCreateFlags,
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT)
+                .extent(vk::Extent3D {
+                    width: swapchain_extent.width,
+                    height: swapchain_extent.height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                // pub queue_family_index_count: u32,
+                // pub p_queue_family_indices: *const u32,
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                ;
+
+            DropGuard::new(
+                unsafe { Self::create_framebuffer_image(dc.as_ref(), allocator.as_ref(), create_info, true) }?,
+                destroy_image
+            )
+        };
+
+        let framebuffer = {
+            let attachments = [swapchain_image.deref().view, depth_image.deref().view];
+
+            let create_info = vk::FramebufferCreateInfo::default()
+                .flags(vk::FramebufferCreateFlags::empty())
+                .render_pass(render_pass)
+                .attachments(&attachments)
+                .width(swapchain_extent.width)
+                .height(swapchain_extent.height)
+                .layers(1);
+
+            DropGuard::new(
+                unsafe { dc.device.create_framebuffer(&create_info, None) }?,
+                |fb| unsafe { dc.device.destroy_framebuffer(*fb, None) }
+            )
+        };
+
+        Ok(Self {
+            swapchain_image: swapchain_image.into_inner(),
+            depth_image: depth_image.into_inner(),
+            framebuffer: framebuffer.into_inner(),
+            swapchain_handle,
+            dc,
+            allocator,
+        })
+    }
+}
+
+impl Drop for Framebuffer {
+    fn drop(&mut self) {
+        // Image destroy function
+        let destroy_image = |img| unsafe {
+            Self::destroy_framebuffer_image(self.dc.as_ref(), self.allocator.as_ref(), img);
+        };
+
+        destroy_image(&mut self.swapchain_image);
+        destroy_image(&mut self.depth_image);
+        unsafe { self.dc.device.destroy_framebuffer(self.framebuffer, None) };
+    }
 }
 
 /// In-flight frame representation
@@ -657,159 +840,6 @@ impl Core {
         })
     }
 
-    /// Create framebuffer image from some external one
-    unsafe fn create_framebuffer_image_external(
-        &self,
-        image: vk::Image,
-        format: vk::Format,
-        is_depthbuffer: bool,
-    ) -> Result<FramebufferImage, vk::Result> {
-        let create_info = vk::ImageViewCreateInfo::default()
-            .components(vk::ComponentMapping::default())
-            .format(format)
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .subresource_range(vk::ImageSubresourceRange::default()
-                .aspect_mask(if is_depthbuffer { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR })
-                .base_array_layer(0)
-                .base_mip_level(0)
-                .layer_count(1)
-                .level_count(1)
-            )
-            ;
-
-        let view = unsafe { self.dc.device.create_image_view(&create_info, None) }?;
-
-        Ok(FramebufferImage {
-            allocation: None,
-            image,
-            view
-        })
-    }
-
-    /// Create completely new framebuffer image
-    unsafe fn create_framebuffer_image(
-        &self,
-        image_create_info: vk::ImageCreateInfo,
-        is_depthbuffer: bool
-    ) -> Result<FramebufferImage, vk::Result> {
-        let allocation_create_info = vk_mem::AllocationCreateInfo {
-            usage: vk_mem::MemoryUsage::AutoPreferDevice,
-            ..Default::default()
-        };
-
-        let image_allocation = DropGuard::new(
-            unsafe { self.allocator._create_image(&image_create_info, &allocation_create_info) }?,
-            |(image, allocation)| unsafe { self.allocator.destroy_image(*image, allocation) }
-        );
-
-        let view_create_info = vk::ImageViewCreateInfo::default()
-            // pub flags: ImageViewCreateFlags,
-            .image(image_allocation.0)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(image_create_info.format)
-            // pub components: ComponentMapping,
-            .subresource_range(vk::ImageSubresourceRange::default()
-                .aspect_mask(if is_depthbuffer { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR })
-                .base_array_layer(0)
-                .base_mip_level(0)
-                .layer_count(image_create_info.array_layers)
-                .level_count(image_create_info.mip_levels)
-            )
-        ;
-
-        let view = unsafe { self.dc.device.create_image_view(&view_create_info, None) }?;
-        let (image, allocation) = image_allocation.into_inner();
-
-        Ok(FramebufferImage {
-            allocation: Some(allocation),
-            image,
-            view
-        })
-    }
-
-    /// Destroy contents of the framebuffer image
-    unsafe fn destroy_framebuffer_image(&self, image: &mut FramebufferImage) {
-        if let Some(allocation) = image.allocation.as_mut() {
-            unsafe { self.allocator.destroy_image(image.image, allocation) };
-        }
-        unsafe { self.dc.device.destroy_image_view(image.view, None) };
-    }
-
-    /// Create framebuffer
-    unsafe fn create_framebuffer(
-        &self,
-        image: vk::Image,
-        image_format: vk::Format,
-        swapchain_handle: Arc<SwapchainHandle>,
-        swapchain_extent: vk::Extent2D,
-    ) -> Result<Framebuffer, vk::Result> {
-        let swapchain_image = DropGuard::new(
-            unsafe { self.create_framebuffer_image_external(image, image_format, false) }?,
-            |img| unsafe { self.destroy_framebuffer_image(img) }
-        );
-
-        let depth_image = {
-            let create_info = vk::ImageCreateInfo::default()
-                // pub flags: ImageCreateFlags,
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(vk::Format::D32_SFLOAT)
-                .extent(vk::Extent3D {
-                    width: swapchain_extent.width,
-                    height: swapchain_extent.height,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                // pub queue_family_index_count: u32,
-                // pub p_queue_family_indices: *const u32,
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                ;
-
-            DropGuard::new(
-                unsafe { self.create_framebuffer_image(create_info, true) }?,
-                |img| unsafe { self.destroy_framebuffer_image(img); }
-            )
-        };
-
-        let framebuffer = {
-            let attachments = [swapchain_image.view, depth_image.view];
-
-            let create_info = vk::FramebufferCreateInfo::default()
-                .flags(vk::FramebufferCreateFlags::empty())
-                .render_pass(self.render_pass)
-                .attachments(&attachments)
-                .width(swapchain_extent.width)
-                .height(swapchain_extent.height)
-                .layers(1);
-
-            DropGuard::new(
-                unsafe { self.dc.device.create_framebuffer(&create_info, None) }?,
-                |fb| unsafe { self.dc.device.destroy_framebuffer(*fb, None) }
-            )
-        };
-
-        Ok(Framebuffer {
-            swapchain_image: swapchain_image.into_inner(),
-            depth_image: depth_image.into_inner(),
-            framebuffer: framebuffer.into_inner(),
-            swapchain_handle,
-        })
-    }
-
-    /// Destroy framebuffer
-    unsafe fn destroy_framebuffer(&self, mut fb: Framebuffer) {
-        unsafe {
-            self.destroy_framebuffer_image(&mut fb.swapchain_image);
-            self.destroy_framebuffer_image(&mut fb.depth_image);
-            self.dc.device.destroy_framebuffer(fb.framebuffer, None);
-        }
-    }
-
     /// Create new frame context
     unsafe fn create_frame_context(&self) -> Result<FrameContext, vk::Result> {
         let command_buffer = {
@@ -864,9 +894,7 @@ impl Core {
 
     unsafe fn destroy_frame_context(&self, mut frame: FrameContext) {
         unsafe {
-            if let Some(fb) = frame.framebuffer.take() {
-                self.destroy_framebuffer(fb);
-            }
+            _ = frame.framebuffer.take();
 
             self.dc.device.free_command_buffers(
                 self.frame_command_pool,
@@ -915,30 +943,23 @@ impl Core {
         index: usize,
         swapchain_handle: Arc<SwapchainHandle>
     ) -> Result<(), vk::Result> {
-        let mut fb_opt = self.frames[index].framebuffer.take();
+        let construction_required = self.frames[index].framebuffer
+            .as_ref()
+            .filter(|fb| fb.swapchain_handle == swapchain_handle)
+            .is_none();
 
-        // Perform filter_map
-        if let Some(fb) = fb_opt {
-            fb_opt = if fb.swapchain_handle != swapchain_handle {
-                unsafe { self.destroy_framebuffer(fb) };
-                None
-            } else {
-                Some(fb)
-            };
-        }
-
-        // Initialize framebuffer
-        self.frames[index].framebuffer = Some(match fb_opt {
-            Some(fb) => fb,
-            None => unsafe {
-                self.create_framebuffer(
-                    self.swapchain.images()[index],
+        if construction_required {
+            self.frames[index].framebuffer = Some(unsafe {
+                Framebuffer::new(
+                    self.dc.clone(),
+                    self.allocator.clone(),
+                    self.render_pass,
                     self.swapchain.image_format(),
-                    swapchain_handle,
-                    self.swapchain.extent()
+                    index,
+                    swapchain_handle
                 )?
-            }
-        });
+            });
+        }
 
         Ok(())
     }
