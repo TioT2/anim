@@ -4,7 +4,10 @@ use ash::vk;
 
 // STD imports
 use std::{
-    cell::{Cell, RefCell}, collections::HashSet, ffi::{CStr, CString}, hash::Hash, ops::Deref, sync::Arc
+    cell::{Cell, RefCell},
+    collections::HashSet,
+    ffi::{CStr, CString},
+    sync::Arc
 };
 
 // ANIM imports
@@ -12,6 +15,7 @@ use crate::{
     math::{self, FMat, FVec},
     render::core::{
         device_context::DeviceContext,
+        shader_compiler::{ShaderCompiler, ShaderCompilerError},
         memory::{Allocator, FlushContext},
         swapchain::{Swapchain, SwapchainHandle},
         util::DropGuard
@@ -19,6 +23,7 @@ use crate::{
 };
 
 mod device_context;
+mod shader_compiler;
 mod memory;
 mod swapchain;
 mod util;
@@ -134,7 +139,7 @@ impl<T> PartialEq for BlindArc<T> {
 
 impl<T> Eq for BlindArc<T> {}
 
-impl<T> Hash for BlindArc<T> {
+impl<T> std::hash::Hash for BlindArc<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::ptr::hash(self.0.as_ref() as *const _, state)
     }
@@ -255,6 +260,9 @@ pub enum CoreInitError {
     /// Suitable presentation mode is missing
     SuitablePresentModeMissing,
 
+    /// Shader compiler related error
+    ShaderCompilerError(ShaderCompilerError),
+
     /// Error happened somewhere in the window context implementation
     WindowContextError(String),
 
@@ -268,8 +276,13 @@ impl From<vk::Result> for CoreInitError {
     }
 }
 
+impl From<ShaderCompilerError> for CoreInitError {
+    fn from(value: ShaderCompilerError) -> Self {
+        Self::ShaderCompilerError(value)
+    }
+}
+
 /// Framebuffer image
-#[derive(Default)]
 struct FramebufferImage {
     /// Image allocation (may be null)
     allocation: Option<vk_mem::Allocation>,
@@ -439,7 +452,7 @@ impl Framebuffer {
         };
 
         let framebuffer = {
-            let attachments = [swapchain_image.deref().view, depth_image.deref().view];
+            let attachments = [swapchain_image.view, depth_image.view];
 
             let create_info = vk::FramebufferCreateInfo::default()
                 .flags(vk::FramebufferCreateFlags::empty())
@@ -515,6 +528,9 @@ pub struct Core {
     /// Memory allocator handle
     allocator: Arc<Allocator>,
 
+    /// Shader compiler
+    _shader_compiler: ShaderCompiler,
+
     /// Swapchain
     swapchain: Swapchain,
 
@@ -575,18 +591,22 @@ impl Core {
             .attachment(0)
             .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
 
-        let depth_att_ref = vk::AttachmentReference::default()
+        let depth_depth_att_ref = vk::AttachmentReference::default()
             .attachment(1)
             .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        let color_depth_att_ref = vk::AttachmentReference::default()
+            .attachment(1)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
 
         let subpasses = [
             vk::SubpassDescription::default()
                 .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                .depth_stencil_attachment(&depth_att_ref),
+                .depth_stencil_attachment(&depth_depth_att_ref),
             vk::SubpassDescription::default()
                 .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
                 .color_attachments(std::array::from_ref(&target_att_ref))
-                .depth_stencil_attachment(&depth_att_ref),
+                .depth_stencil_attachment(&color_depth_att_ref),
         ];
 
         let dependencies = [
@@ -608,9 +628,88 @@ impl Core {
         unsafe { dc.device.create_render_pass(&create_info, None) }
     }
 
-    /// Create (the) pipeline
+    /// Create pipeline used for matrix computation
+    unsafe fn _create_matrix_compute_pipeline(
+        dc: &DeviceContext,
+        shader_compiler: &ShaderCompiler
+    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline), vk::Result> {
+        let ds_layout = {
+            let bindings = [
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(0)
+            ];
+
+            let create_info = vk::DescriptorSetLayoutCreateInfo::default()
+                .bindings(&bindings);
+
+            DropGuard::new(
+                unsafe { dc.device.create_descriptor_set_layout(&create_info, None) }?,
+                |dsl| unsafe { dc.device.destroy_descriptor_set_layout(*dsl, None) }
+            )
+        };
+
+        let pipeline_layout = {
+            let create_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(std::array::from_ref(&*ds_layout))
+                ;
+
+            DropGuard::new(
+                unsafe { dc.device.create_pipeline_layout(&create_info, None) }?,
+                |pl| unsafe { dc.device.destroy_pipeline_layout(*pl, None) }
+            )
+        };
+
+        let shader_module = {
+            let spirv = shader_compiler
+                .compile_shader("/anim/matrix_compute.hlsl", "cs_main", "cs_5_1")
+                .unwrap();
+
+            let module = unsafe {
+                dc.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spirv), None)
+            }?;
+
+            DropGuard::new(
+                module,
+                |module| unsafe { dc.device.destroy_shader_module(*module, None) }
+            )
+        };
+
+        let stage_create_info = vk::PipelineShaderStageCreateInfo::default()
+            // pub flags: PipelineShaderStageCreateFlags,
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(*shader_module)
+            .name(c"cs_main")
+            // pub p_specialization_info: *const SpecializationInfo<'a>,
+            ;
+
+        let create_info = vk::ComputePipelineCreateInfo::default()
+            // pub flags: PipelineCreateFlags,
+            .stage(stage_create_info)
+            // pub stage: PipelineShaderStageCreateInfo<'a>,
+            .layout(*pipeline_layout)
+            // pub base_pipeline_handle: Pipeline,
+            // pub base_pipeline_index: i32,
+            ;
+
+        let pipeline = unsafe {
+            dc.device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                std::array::from_ref(&create_info),
+                None
+            ).map_err(|(_, err)| err)?[0]
+        };
+
+        Ok((
+            ds_layout.into_inner(),
+            pipeline_layout.into_inner(),
+            pipeline
+        ))
+    }
+
+    /// Create set of pipelines with same usecase
     unsafe fn create_pipeline_family(
         dc: &DeviceContext,
+        shader_compiler: &ShaderCompiler,
         render_pass: vk::RenderPass
     ) -> Result<(vk::PipelineLayout, (vk::Pipeline, vk::Pipeline)), vk::Result> {
         let layout = {
@@ -631,42 +730,24 @@ impl Core {
         };
 
         let shader_modules = {
-            let compile = |main_fn_name: &str, shader_model: &str| {
-                let spirv_bytes = hassle_rs::compile_hlsl(
-                    "static/model.hlsl",
-                    include_str!("static/model.hlsl"),
-                    main_fn_name,
-                    shader_model,
-                    &["-spirv"],
-                    &[]
-                ).unwrap();
+            let build = |main_fn_name: &str, shader_model: &str| {
+                let spirv = shader_compiler
+                    .compile_shader("/anim/model.hlsl", main_fn_name, shader_model)
+                    .unwrap();
 
-                // Repack SPIR-V as bytes into [u32]
-                let spirv = spirv_bytes
-                    .chunks(4)
-                    .map(|v| {
-                        let mut bytes = [0u8; 4];
-                        bytes.copy_from_slice(v);
-                        u32::from_ne_bytes(bytes)
-                    })
-                    .collect::<Vec<u32>>();
-
-                let module_create_info = vk::ShaderModuleCreateInfo::default().code(&spirv);
-
-                let module = unsafe { dc.device.create_shader_module(&module_create_info, None) }?;
-
-                Ok(module)
+                Ok(DropGuard::new(
+                    unsafe {
+                        dc.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spirv), None)
+                    }?,
+                    |sm| unsafe { dc.device.destroy_shader_module(*sm, None) }
+                ))
             };
 
-            let drop = |m: &mut vk::ShaderModule| unsafe { dc.device.destroy_shader_module(*m, None) };
-
-            let guards = [
-                DropGuard::new(compile("vs_main",       "vs_5_1")?, drop),
-                DropGuard::new(compile("fs_main",       "ps_5_1")?, drop),
-                DropGuard::new(compile("vs_depth_main", "vs_5_1")?, drop),
-            ];
-
-            DropGuard::zip_multiple(guards.into_iter())
+            DropGuard::zip_multiple([
+                build("vs_main",       "vs_5_1")?,
+                build("fs_main",       "ps_5_1")?,
+                build("vs_depth_main", "vs_5_1")?,
+            ].into_iter())
         };
 
         let vertex_input_binding_desc = vk::VertexInputBindingDescription::default()
@@ -838,6 +919,8 @@ impl Core {
     ) -> Result<Self, CoreInitError> {
         let dc = Arc::new(DeviceContext::new(window_context, application_name)?);
         let swapchain = Swapchain::new(dc.clone(), true)?;
+        let allocator = Arc::new(Allocator::new(dc.clone())?);
+        let shader_compiler = ShaderCompiler::new()?;
 
         // Create render pass
         let render_pass = DropGuard::new(
@@ -861,12 +944,19 @@ impl Core {
             |semaphore| unsafe { dc.device.destroy_semaphore(*semaphore, None) }
         );
 
-        let allocator = Arc::new(Allocator::new(dc.clone())?);
-
         let (pipeline_layout, pipelines) = unsafe {
-            Self::create_pipeline_family(dc.as_ref(), *render_pass)
+            Self::create_pipeline_family(dc.as_ref(), &shader_compiler, *render_pass)
         }?;
-        let (depth_pipeline, color_pipeline) = pipelines;
+        let pipeline_layout = DropGuard::new(
+            pipeline_layout,
+            |pl| unsafe { dc.device.destroy_pipeline_layout(*pl, None) }
+        );
+        let protect_pipeline = |pipeline| DropGuard::new(
+            pipeline,
+            |p| unsafe { dc.device.destroy_pipeline(*p, None) }
+        );
+        let depth_pipeline = protect_pipeline(pipelines.0);
+        let color_pipeline = protect_pipeline(pipelines.1);
 
         Ok(Self {
             frame_command_pool: frame_command_pool.into_inner(),
@@ -884,9 +974,10 @@ impl Core {
 
                 FMat::mul(&projection, &view)
             },
-            depth_pipeline,
-            color_pipeline,
-            pipeline_layout,
+            depth_pipeline: depth_pipeline.into_inner(),
+            color_pipeline: color_pipeline.into_inner(),
+            pipeline_layout: pipeline_layout.into_inner(),
+            _shader_compiler: shader_compiler,
             allocator,
             swapchain,
             dc,
@@ -1082,6 +1173,85 @@ impl Core {
         }))
     }
 
+    /// Record contents for the depth and color subpass
+    fn record_subpass_contents<const SUBPASS_INDEX: u32>(&self, frame: &FrameContext) {
+        // Bind pipeline
+        unsafe {
+            self.dc.device.cmd_bind_pipeline(
+                frame.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                match SUBPASS_INDEX {
+                    0 => self.depth_pipeline,
+                    1 => self.color_pipeline,
+                    _ => panic!("Invalid subpass index")
+                }
+            );
+        }
+
+        // Set scissor and viewport
+        unsafe {
+            let extent = self.swapchain.extent();
+
+            let scissor = vk::Rect2D::default().extent(extent);
+            self.dc.device.cmd_set_scissor(frame.command_buffer, 0, std::array::from_ref(&scissor));
+
+            let viewport = vk::Viewport {
+                width: extent.width as f32,
+                height: extent.height as f32,
+                x: 0.0,
+                y: 0.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            self.dc.device.cmd_set_viewport(frame.command_buffer, 0, std::array::from_ref(&viewport));
+        }
+
+        // Render!
+        for instance in &frame.render_set {
+            // Calculate world-view-projection matrix
+            let world_view_projection = FMat::mul(
+                &self.matrix_view_projection,
+                &instance.transform.get(),
+            );
+
+            // Emit draw commands
+            unsafe {
+                self.dc.device.cmd_bind_vertex_buffers(
+                    frame.command_buffer, 0,
+                    &[instance.mesh.buffer],
+                    &[instance.mesh.vertex_span.start as u64]
+                );
+
+                self.dc.device.cmd_bind_index_buffer(
+                    frame.command_buffer,
+                    instance.mesh.buffer,
+                    instance.mesh.index_span.start as u64,
+                    vk::IndexType::UINT32
+                );
+
+                self.dc.device.cmd_push_constants(
+                    frame.command_buffer,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    std::slice::from_raw_parts(
+                        (&world_view_projection as *const FMat) as *const u8,
+                        std::mem::size_of::<FMat>()
+                    )
+                );
+
+                self.dc.device.cmd_draw_indexed(
+                    frame.command_buffer,
+                    instance.mesh.index_count as u32,
+                    1,
+                    0,
+                    0,
+                    0
+                );
+            }
+        }
+    }
+
     /// Render next frame
     pub fn render_frame(&mut self) -> Result<(), vk::Result> {
         let frame_acquired_semaphore = self.buffered_semaphore.get();
@@ -1123,6 +1293,7 @@ impl Core {
         frame.flush_context.replace(
             self.allocator.clone().flush(frame.transfer_finished_semaphore)?
         );
+        let frame = &self.frames[swapchain_image_index as usize];
 
         // Reset rendering command buffer
         unsafe {
@@ -1137,6 +1308,8 @@ impl Core {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
             )?;
         }
+
+        // Begin compute pass
 
         // Construct clear values
         let clear_values = {
@@ -1168,29 +1341,7 @@ impl Core {
                 .offset(vk::Offset2D::default())
                 .extent(self.swapchain.extent())
             )
-            .clear_values(&clear_values)
-        ;
-
-        unsafe {
-            let time = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64();
-
-            static mut FRAME_COUNT: u32 = 0;
-            static mut LAST_MEASURE: f64 = 0.0;
-
-            FRAME_COUNT += 1;
-            if time - LAST_MEASURE >= 1.0 {
-                let fps = FRAME_COUNT as f64 / (time - LAST_MEASURE);
-                LAST_MEASURE = time;
-                FRAME_COUNT = 0;
-
-                if fps >= 0.001 {
-                    println!("FPS: {}", fps);
-                }
-            }
-        }
+            .clear_values(&clear_values);
 
         unsafe {
             self.dc.device.cmd_begin_render_pass(
@@ -1200,78 +1351,7 @@ impl Core {
             )
         };
 
-        // Bind pipeline
-        unsafe {
-            self.dc.device.cmd_bind_pipeline(
-                frame.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.depth_pipeline
-            );
-        }
-
-        // Set scissor and viewport
-        unsafe {
-            let extent = self.swapchain.extent();
-
-            let scissor = vk::Rect2D::default().extent(extent);
-            self.dc.device.cmd_set_scissor(frame.command_buffer, 0, std::array::from_ref(&scissor));
-
-            let viewport = vk::Viewport {
-                width: extent.width as f32,
-                height: extent.height as f32,
-                x: 0.0,
-                y: 0.0,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            self.dc.device.cmd_set_viewport(frame.command_buffer, 0, std::array::from_ref(&viewport));
-        }
-
-        // Render!
-        for instance in &frame.render_set {
-            // Calculate world-view-projection matrix
-            let world_view_projection = FMat::mul(
-                &self.matrix_view_projection,
-                // &FMat::translate(FVec::new3(0.0, time.sin() as f32, 0.0)),
-                &instance.transform.get(),
-            );
-
-            // Emit draw commands
-            unsafe {
-                self.dc.device.cmd_bind_vertex_buffers(
-                    frame.command_buffer, 0,
-                    &[instance.mesh.buffer],
-                    &[instance.mesh.vertex_span.start as u64]
-                );
-
-                self.dc.device.cmd_bind_index_buffer(
-                    frame.command_buffer,
-                    instance.mesh.buffer,
-                    instance.mesh.index_span.start as u64,
-                    vk::IndexType::UINT32
-                );
-
-                self.dc.device.cmd_push_constants(
-                    frame.command_buffer,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    std::slice::from_raw_parts(
-                        (&world_view_projection as *const FMat) as *const u8,
-                        std::mem::size_of::<FMat>()
-                    )
-                );
-
-                self.dc.device.cmd_draw_indexed(
-                    frame.command_buffer,
-                    instance.mesh.index_count as u32,
-                    1,
-                    0,
-                    0,
-                    0
-                );
-            }
-        }
+        self.record_subpass_contents::<0>(frame);
 
         unsafe {
             self.dc.device.cmd_next_subpass(
@@ -1280,78 +1360,7 @@ impl Core {
             );
         }
 
-        // Bind pipeline
-        unsafe {
-            self.dc.device.cmd_bind_pipeline(
-                frame.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.color_pipeline
-            );
-        }
-
-        // Set scissor and viewport
-        unsafe {
-            let extent = self.swapchain.extent();
-
-            let scissor = vk::Rect2D::default().extent(extent);
-            self.dc.device.cmd_set_scissor(frame.command_buffer, 0, std::array::from_ref(&scissor));
-
-            let viewport = vk::Viewport {
-                width: extent.width as f32,
-                height: extent.height as f32,
-                x: 0.0,
-                y: 0.0,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            self.dc.device.cmd_set_viewport(frame.command_buffer, 0, std::array::from_ref(&viewport));
-        }
-
-        // Render!
-        for instance in &frame.render_set {
-            // Calculate world-view-projection matrix
-            let world_view_projection = FMat::mul(
-                &self.matrix_view_projection,
-                // &FMat::translate(FVec::new3(0.0, time.sin() as f32, 0.0)),
-                &instance.transform.get(),
-            );
-
-            // Emit draw commands
-            unsafe {
-                self.dc.device.cmd_bind_vertex_buffers(
-                    frame.command_buffer, 0,
-                    &[instance.mesh.buffer],
-                    &[instance.mesh.vertex_span.start as u64]
-                );
-
-                self.dc.device.cmd_bind_index_buffer(
-                    frame.command_buffer,
-                    instance.mesh.buffer,
-                    instance.mesh.index_span.start as u64,
-                    vk::IndexType::UINT32
-                );
-
-                self.dc.device.cmd_push_constants(
-                    frame.command_buffer,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    std::slice::from_raw_parts(
-                        (&world_view_projection as *const FMat) as *const u8,
-                        std::mem::size_of::<FMat>()
-                    )
-                );
-
-                self.dc.device.cmd_draw_indexed(
-                    frame.command_buffer,
-                    instance.mesh.index_count as u32,
-                    1,
-                    0,
-                    0,
-                    0
-                );
-            }
-        }
+        self.record_subpass_contents::<1>(frame);
 
         unsafe {
             self.dc.device.cmd_end_render_pass(frame.command_buffer);

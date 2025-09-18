@@ -57,6 +57,9 @@ fn main() {
 
     instance.enable();
 
+    let mut fps_frame_count = 0;
+    let mut fps_last_measure = std::time::Instant::now();
+
     'main_loop: loop {
         'event_loop: while let Some(event) = event_pump.poll_event() {
             type Event = sdl2::event::Event;
@@ -89,6 +92,18 @@ fn main() {
                 Event::Quit { .. } => break 'main_loop,
                 _ => {}
             }
+        }
+
+        fps_frame_count += 1;
+
+        let time_now = std::time::Instant::now();
+        let fps_duration = time_now.duration_since(fps_last_measure);
+
+        if fps_duration >= std::time::Duration::from_secs(1) {
+            let fps = fps_frame_count as f64 / fps_duration.as_secs_f64();
+            fps_frame_count = 0;
+            fps_last_measure = time_now;
+            println!("FPS: {}", fps);
         }
 
         // Render next frame (literally)
