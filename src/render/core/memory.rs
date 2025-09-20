@@ -135,7 +135,7 @@ impl Allocator {
         })
     }
 
-    /// Create raw vulkan buffer
+    /// Create (infrequent) raw vulkan buffer
     pub unsafe fn create_buffer(
         &self,
         buffer_create_info: &vk::BufferCreateInfo,
@@ -310,6 +310,28 @@ impl Allocator {
         }
 
         Ok(())
+    }
+
+    /// Access to the host buffer
+    pub unsafe fn map_host_allocation<T>(
+        &self,
+        allocation: &mut vk_mem::Allocation,
+        func: impl FnOnce(&mut [u8]) -> T
+    ) -> Result<T, vk::Result> {
+        _ = unsafe { self.allocator.map_memory(allocation) }?;
+        let alloc_info = self.allocator.get_allocation_info(allocation);
+
+        let mapped_slice = unsafe {
+            std::slice::from_raw_parts_mut(alloc_info.mapped_data as *mut u8, alloc_info.size as usize)
+        };
+
+        // Write data to the staging buffer
+        let value = func(mapped_slice);
+
+        // Unmap staging buffer and write it to corresponding buffer set
+        unsafe { self.allocator.unmap_memory(allocation) };
+
+        Ok(value)
     }
 
     /// Flush all copy operations
