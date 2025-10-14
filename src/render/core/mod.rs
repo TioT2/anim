@@ -576,28 +576,28 @@ struct FrameContext {
     /// Command buffer used for frame commands
     command_buffer: vk::CommandBuffer,
 
-    /// New framebuffer structure
+    /// Frame buffer storage (option becase of it's laziness nature)
     framebuffer: Option<Framebuffer>,
 
-    /// Context of the flush operations
+    /// Context of the allocator operations
     flush_context: Option<FlushContext>,
 
-    /// Buffer that contains matrix data
+    /// Buffer that contains data for matrix computation (why it's even a structure?)
     matrix_buffer: MatrixBuffer,
 
     /// Camera buffer
     camera_buffer: vk::Buffer,
 
-    /// Corresponding allocation
+    /// Allocation that holds camera buffer
     camera_buffer_allocation: vk_mem::Allocation,
 
-    /// Pool for the matrix_descriptor_set field
+    /// Pool for matrix and render descriptor set allocation
     frame_descriptor_pool: vk::DescriptorPool,
 
     /// Matirx descriptor set
     matrix_descriptor_set: vk::DescriptorSet,
 
-    /// Descriptor set used in rendering process
+    /// Main rendering descriptor set (holds matrix and camera buffers)
     render_descriptor_set: vk::DescriptorSet,
 
     /// Current frame render set
@@ -618,7 +618,7 @@ pub struct Core {
     /// Swapchain
     swapchain: Swapchain,
 
-    /// Command pool for per-frame allocation command buffer
+    /// Command pool for per-frame command buffer allocation
     frame_command_pool: vk::CommandPool,
 
     /// Unsignaled semaphore to use as a new frame semaphore
@@ -626,6 +626,9 @@ pub struct Core {
 
     /// Main render pass
     render_pass: vk::RenderPass,
+
+    /// DS layout used during rendering process
+    render_ds_layout: vk::DescriptorSetLayout,
 
     /// Temp pipeline layout storage
     render_pipeline_layout: vk::PipelineLayout,
@@ -638,9 +641,6 @@ pub struct Core {
 
     /// Matrix descriptor set layout
     matrix_ds_layout: vk::DescriptorSetLayout,
-
-    /// DS layout used during rendering process
-    render_ds_layout: vk::DescriptorSetLayout,
 
     /// Matrix pipeline layout
     matrix_pipeline_layout: vk::PipelineLayout,
@@ -671,6 +671,7 @@ impl Core {
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+
         let depth_attachment = vk::AttachmentDescription::default()
             // pub flags: AttachmentDescriptionFlags,
             .format(vk::Format::D32_SFLOAT)
@@ -1533,25 +1534,35 @@ impl Core {
             self.dc.device.cmd_set_viewport(frame.command_buffer, 0, std::array::from_ref(&viewport));
         }
 
+        // Addr of the pointer to currently-bound mesh (addr cannot be zero, so 0 is good initial value)
+        let mut current_mesh_addr: usize = 0;
+
         // Render!
         for (instance_index, instance) in frame.render_set.iter().enumerate() {
             let instance_index = instance_index as u32;
+            let mesh_addr = Arc::as_ptr(&instance.mesh).addr();
+
+            // Bind new mesh only if it's really required
+            if mesh_addr != current_mesh_addr {
+                unsafe {
+                    self.dc.device.cmd_bind_vertex_buffers(
+                        frame.command_buffer, 0,
+                        &[instance.mesh.buffer],
+                        &[instance.mesh.vertex_span.start as u64]
+                    );
+
+                    self.dc.device.cmd_bind_index_buffer(
+                        frame.command_buffer,
+                        instance.mesh.buffer,
+                        instance.mesh.index_span.start as u64,
+                        vk::IndexType::UINT32
+                    );
+                }
+                current_mesh_addr = mesh_addr;
+            }
 
             // Emit draw commands
             unsafe {
-                self.dc.device.cmd_bind_vertex_buffers(
-                    frame.command_buffer, 0,
-                    &[instance.mesh.buffer],
-                    &[instance.mesh.vertex_span.start as u64]
-                );
-
-                self.dc.device.cmd_bind_index_buffer(
-                    frame.command_buffer,
-                    instance.mesh.buffer,
-                    instance.mesh.index_span.start as u64,
-                    vk::IndexType::UINT32
-                );
-
                 // Push instance index
                 self.dc.device.cmd_push_constants(
                     frame.command_buffer,
@@ -1675,6 +1686,10 @@ impl Core {
 
         // Take current render set snapshot
         frame.render_set = self.render_set.snapshot();
+        frame.render_set.sort_by(|l, r| std::cmp::Ord::cmp(
+            &Arc::as_ptr(l),
+            &Arc::as_ptr(r)
+        ));
 
         // Write frame camera buffer
         {
@@ -1737,6 +1752,7 @@ impl Core {
             )?;
         }
 
+        // Render!
         unsafe {
             self.dc.device.cmd_bind_pipeline(
                 frame.command_buffer,

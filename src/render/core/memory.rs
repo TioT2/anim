@@ -18,7 +18,7 @@ struct StagingBuffer {
 
 /// Context of the flush operation, needs to be saved while flush is not finished
 /// # Safety
-/// Flush context is drop-safe only after flushed operations completed
+/// Dropping flush context before flush operations complete may lead to validation errors
 pub struct FlushContext {
     /// Buffer
     staging_buffers: Vec<StagingBuffer>,
@@ -40,9 +40,9 @@ impl Drop for FlushContext {
     }
 }
 
-/// Object that manages memory allocations and transitions
+/// Object that manages memory allocations and state transitions
 /// # Note
-/// Field order **does matter** here, Allocator **must be** dropped before DeviceContext (it may be the last reference)
+/// Field order **does** matter here, Allocator **must be** dropped before DeviceContext due to DeviceContext's shared nature.
 pub struct Allocator {
     /// Underlying allocator
     allocator: vk_mem::Allocator,
@@ -135,7 +135,7 @@ impl Allocator {
         })
     }
 
-    /// Create (infrequent) raw vulkan buffer
+    /// Create raw vulkan buffer
     pub unsafe fn create_buffer(
         &self,
         buffer_create_info: &vk::BufferCreateInfo,

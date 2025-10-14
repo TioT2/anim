@@ -47,9 +47,8 @@ impl ShaderCompiler {
         let compiler = instance.create_compiler()?;
 
         fn static_path(path: &str) -> Result<std::path::PathBuf, ShaderCompilerError> {
-            let path: std::path::PathBuf = path.into();
-
-            std::path::absolute(path).map_err(ShaderCompilerError::InvalidPath)
+            std::path::absolute(Into::<std::path::PathBuf>::into(path))
+                .map_err(ShaderCompilerError::InvalidPath)
         }
 
         let static_shaders = {

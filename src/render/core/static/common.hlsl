@@ -66,9 +66,9 @@ namespace anim {
         /// Unpack octmapped unit vector (without renormalization, thus)
         float3 unpack(float2 packed) {
             float3 n = float3(packed.x, packed.y, 1.0 - abs(packed.x) - abs(packed.y));
-       	float t = saturate(-n.z);
-       	n.xy += select(n.xy >= 0.0, t, -t);
-       	return n;
+                float t = saturate(-n.z);
+                n.xy += select(n.xy >= 0.0, t, -t);
+                return n;
         }
 
         /// Pack octmapped vector
