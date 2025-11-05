@@ -9,6 +9,6 @@ pub use fast::*;
 // Construct column-vector
 #[macro_export]
 macro_rules! vector {
-    ($($item: expr),+) => { crate::math::Mat::new_column([$($item),*]) }
+    ($($item: expr),+) => { $crate::math::Mat::new_column([$($item),*]) }
 }
 pub use vector;

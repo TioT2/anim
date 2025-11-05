@@ -1,6 +1,6 @@
 //! Memory allocation implementation file
 
-use std::{cell::{Cell, RefCell}, sync::Arc};
+use std::{cell::{Cell, RefCell}, sync::{Arc, Mutex}};
 
 use ash::vk;
 use vk_mem::Alloc;
@@ -35,15 +35,58 @@ impl Drop for FlushContext {
         // Command buffer and staging buffer array data
         unsafe { self.allocator.free_write_command_buffer(self.command_buffer) };
         self.staging_buffers.drain(..).for_each(|mut b| unsafe {
-            self.allocator.destroy_buffer(b.buffer, &mut b.allocation);
+            self.allocator.destroy_raw_buffer(b.buffer, &mut b.allocation);
         });
     }
 }
 
+/// Default buffer structure
+pub struct Buffer {
+    /// Allocator reference
+    allocator: Arc<Allocator>,
+
+    /// Create host allocation
+    allocation: Option<Mutex<vk_mem::Allocation>>,
+
+    /// Memory buffer
+    buffer: vk::Buffer,
+}
+
+impl Buffer {
+    /// Get Vulkan-level buffer handle
+    pub fn handle(&self) -> vk::Buffer {
+        self.buffer
+    }
+
+    /// Map the buffer as a host buffer
+    pub fn host_map(&self, func: impl FnOnce(&mut [u8])) -> Result<(), vk::Result> {
+        if let Some(allocation) = self.allocation.as_ref() {
+            unsafe { self.allocator.map_host_allocation(&mut allocation.lock().unwrap(), func) }
+        } else {
+            func(&mut []);
+            Ok(())
+        }
+    }
+
+    /// Write data to buffer
+    pub fn write(&self, offset: usize, data: &[u8]) -> Result<(), vk::Result> {
+        unsafe { self.allocator.write_buffer(self.buffer, offset, data) }
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        if let Some(allocation) = self.allocation.take() {
+            unsafe { self.allocator.destroy_raw_buffer(self.buffer, &mut allocation.lock().unwrap()) };
+        }
+    }
+}
+
 /// Object that manages memory allocations and state transitions
-/// # Note
-/// Field order **does** matter here, Allocator **must be** dropped before DeviceContext due to DeviceContext's shared nature.
 pub struct Allocator {
+    // # Note
+    // Field order **does** matter here, Allocator **must be** dropped before DeviceContext due to DeviceContext's shared nature.
+
     /// Underlying allocator
     allocator: vk_mem::Allocator,
 
@@ -135,8 +178,32 @@ impl Allocator {
         })
     }
 
+    /// Construct buffer
+    pub fn create_buffer(
+        self: &Arc<Self>,
+        buffer_ci: &vk::BufferCreateInfo,
+        allocation_ci: &vk_mem::AllocationCreateInfo
+    ) -> Result<Arc<Buffer>, vk::Result> {
+        let (buffer, allocation) = unsafe { self.create_raw_buffer(buffer_ci, allocation_ci) }?;
+
+        Ok(Arc::new(Buffer {
+            allocator: self.clone(),
+            allocation: Some(Mutex::new(allocation)),
+            buffer,
+        }))
+    }
+
+    /// Create empty buffer that refers to nothing
+    pub fn create_empty_buffer(self: &Arc<Self>) -> Arc<Buffer> {
+        Arc::new(Buffer {
+            allocation: None,
+            allocator: self.clone(),
+            buffer: vk::Buffer::null(),
+        })
+    }
+
     /// Create raw vulkan buffer
-    pub unsafe fn create_buffer(
+    unsafe fn create_raw_buffer(
         &self,
         buffer_create_info: &vk::BufferCreateInfo,
         allocation_create_info: &vk_mem::AllocationCreateInfo
@@ -152,7 +219,7 @@ impl Allocator {
     }
 
     /// Destroy raw vulkan buffer
-    pub unsafe fn destroy_buffer(
+    unsafe fn destroy_raw_buffer(
         &self,
         buffer: vk::Buffer,
         allocation: &mut vk_mem::Allocation
@@ -272,11 +339,7 @@ impl Allocator {
 
         // Write data to the staging buffer
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                mapped_data as *mut u8,
-                data.len()
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped_data, data.len());
         }
 
         // Unmap staging buffer and write it to corresponding buffer set
@@ -287,7 +350,7 @@ impl Allocator {
     }
 
     /// Write data to device buffer from host
-    pub unsafe fn write_buffer(
+    unsafe fn write_buffer(
         &self,
         buffer: vk::Buffer,
         offset: usize,
@@ -313,11 +376,11 @@ impl Allocator {
     }
 
     /// Access to the host buffer
-    pub unsafe fn map_host_allocation<T>(
+    pub unsafe fn map_host_allocation(
         &self,
         allocation: &mut vk_mem::Allocation,
-        func: impl FnOnce(&mut [u8]) -> T
-    ) -> Result<T, vk::Result> {
+        func: impl FnOnce(&mut [u8])
+    ) -> Result<(), vk::Result> {
         _ = unsafe { self.allocator.map_memory(allocation) }?;
         let alloc_info = self.allocator.get_allocation_info(allocation);
 
@@ -326,12 +389,12 @@ impl Allocator {
         };
 
         // Write data to the staging buffer
-        let value = func(mapped_slice);
+        func(mapped_slice);
 
         // Unmap staging buffer and write it to corresponding buffer set
         unsafe { self.allocator.unmap_memory(allocation) };
 
-        Ok(value)
+        Ok(())
     }
 
     /// Flush all copy operations
@@ -385,7 +448,7 @@ impl Drop for Allocator {
             self.dc.device.destroy_semaphore(semaphore2, None);
 
             for mut buffer in self.staging_buffers.replace(Vec::new()).into_iter() {
-                self.destroy_buffer(buffer.buffer, &mut buffer.allocation);
+                self.destroy_raw_buffer(buffer.buffer, &mut buffer.allocation);
             }
             // Do not perform operations from last command buffer
             _ = self.dc.device.end_command_buffer(self.write_command_buffer.get());

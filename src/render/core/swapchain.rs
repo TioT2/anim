@@ -117,7 +117,7 @@ impl Swapchain {
         // Find one from suitable list
         [vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO]
             .into_iter()
-            .find(|mode| present_modes.contains(&mode))
+            .find(|mode| present_modes.contains(mode))
             .ok_or(CoreInitError::SuitablePresentModeMissing)
     }
 
@@ -157,7 +157,7 @@ impl Swapchain {
 
         let handle = SwapchainHandle {
             dc: self.dc.clone(),
-            swapchain: swapchain,
+            swapchain,
             revision,
             extent: surface_caps.current_extent,
             images: images.into_boxed_slice(),

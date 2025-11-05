@@ -54,11 +54,11 @@ namespace anim {
 
     /// Common vertex structure
     struct CommonVertex {
-        [[vk::location(0)]] float3 position : POSITION0;
+        [[vk::location(0)]] float3 position  : POSITION0;
         [[vk::location(1)]] float2 tex_coord : TEXCOORD0;
-        [[vk::location(2)]] float2 normal : NORMAL0;
-        [[vk::location(3)]] float2 tangent : TANGENT0;
-        [[vk::location(4)]] float4 misc : COLOR0;
+        [[vk::location(2)]] float2 normal    : NORMAL0;
+        [[vk::location(3)]] float2 tangent   : TANGENT0;
+        [[vk::location(4)]] float4 misc      : COLOR0;
     };
 
     // Octmap implementation
@@ -66,15 +66,16 @@ namespace anim {
         /// Unpack octmapped unit vector (without renormalization, thus)
         float3 unpack(float2 packed) {
             float3 n = float3(packed.x, packed.y, 1.0 - abs(packed.x) - abs(packed.y));
-                float t = saturate(-n.z);
-                n.xy += select(n.xy >= 0.0, t, -t);
-                return n;
+            float t = saturate(-n.z);
+
+            n.xy += select(n.xy >= 0.0, t, -t);
+            return n;
         }
 
         /// Pack octmapped vector
         float2 pack(float3 u) {
             // Normalize by Manhattan norm
-            u /= (abs(u.x) + abs(u.y) + abs(u.z));
+            u /= abs(u.x) + abs(u.y) + abs(u.z);
 
             // Perform octahedral wrap for lower octahedron part
             return u.z >= 0.0

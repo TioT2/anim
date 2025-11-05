@@ -123,9 +123,9 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
 
     for (line, line_number) in iter {
         word_vec.clear();
-        word_vec.extend(line.split_whitespace().filter(|w| w.len() != 0));
+        word_vec.extend(line.split_whitespace().filter(|w| !w.is_empty()));
 
-        let Some(kind) = word_vec.get(0).copied() else {
+        let Some(kind) = word_vec.first().copied() else {
             continue;
         };
 
@@ -221,7 +221,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
                                 position: positions
                                     .get(pi as usize)
                                     .copied()
-                                    .ok_or_else(|| ParsingError::BadFaceIndex {
+                                    .ok_or(ParsingError::BadFaceIndex {
                                         component: FaceComponent::Vertex,
                                         pool_len: positions.len() as u32,
                                         index: pi,
@@ -229,7 +229,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
                                 tex_coord: tex_coords
                                     .get(ti as usize)
                                     .copied()
-                                    .ok_or_else(|| ParsingError::BadFaceIndex {
+                                    .ok_or(ParsingError::BadFaceIndex {
                                         component: FaceComponent::TexCoord,
                                         pool_len: tex_coords.len() as u32,
                                         index: ti,
@@ -237,7 +237,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
                                 normal: normals
                                     .get(ni as usize)
                                     .copied()
-                                    .ok_or_else(|| ParsingError::BadFaceIndex {
+                                    .ok_or(ParsingError::BadFaceIndex {
                                         component: FaceComponent::Normal,
                                         pool_len: normals.len() as u32,
                                         index: ni,

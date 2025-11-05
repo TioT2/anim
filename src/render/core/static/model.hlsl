@@ -1,4 +1,4 @@
-/// Ubershader (I hope it will become...)
+/// The Ubershader (I hope it will become...)
 
 #include <anim/common.hlsl>
 

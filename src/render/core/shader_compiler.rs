@@ -65,7 +65,7 @@ impl ShaderCompiler {
                 "common.hlsl",
                 "matrix_compute.hlsl",
                 "model.hlsl",
-            ).into_iter())
+            ))
         };
 
         Ok(Self {
@@ -81,7 +81,7 @@ impl ShaderCompiler {
         &self,
         path: &str
     ) -> Result<std::borrow::Cow<'static, str>, ShaderCompilerError> {
-        let path = std::path::absolute(std::path::PathBuf::try_from(path).unwrap())
+        let path = std::path::absolute(std::path::PathBuf::from(path))
             .map_err(ShaderCompilerError::InvalidPath)?;
 
         if let Some(static_shader) = self.static_shaders.get(&path) {

@@ -36,16 +36,18 @@ impl<T, const R: usize, const C: usize> Mat<T, R, C> {
 
 impl<T, const R: usize, const C: usize> Mat<MaybeUninit<T>, R, C> {
     /// New uninit matrix
-    pub unsafe fn new_uninit() -> Self {
+    pub const fn new_uninit() -> Self {
         Self(unsafe { MaybeUninit::<[[MaybeUninit<T>; R]; C]>::uninit().assume_init_read() })
     }
 
     /// New zeroed uninit matirx
-    pub unsafe fn new_zeroed() -> Self {
+    pub const fn new_zeroed() -> Self {
         Self(unsafe { MaybeUninit::<[[MaybeUninit<T>; R]; C]>::zeroed().assume_init_read() })
     }
 
     /// Assume that matrix is initialized
+    /// # Safety
+    /// All matrix elements **must** be initialized
     pub unsafe fn assume_init(self) -> Mat<T, R, C> {
         self.map(|u| unsafe { u.assume_init() })
     }
@@ -73,7 +75,7 @@ macro_rules! matrix_impl_matrix_operator {
             fn $fn_name(self, rhs: Mat<T, R, C>) -> Self::Output {
                 let lhs = self.map(MaybeUninit::new);
                 let rhs = rhs.map(MaybeUninit::new);
-                let mut uninit = unsafe { Mat::<MaybeUninit<T>, R, C>::new_uninit() };
+                let mut uninit = Mat::<MaybeUninit<T>, R, C>::new_uninit();
 
                 matrix_foreach_index!(x, y, {
                     uninit.0[x][y].write(unsafe {
@@ -158,16 +160,14 @@ impl<T, const R: usize> Mat<T, R, 1> {
         let [lhs] = self.0;
         let [rhs] = rhs.0;
 
-        std::iter::zip(lhs.into_iter(), rhs.into_iter())
-            .map(|(l, r)| l * r)
-            .sum()
+        std::iter::zip(lhs, rhs).map(|(l, r)| l * r).sum()
     }
 }
 
 impl<T: Clone, const N: usize> Mat<T, N, N> {
     /// Construct diagonal matrix
     pub fn diagonal(diagonal: [T; N], zero: T) -> Self {
-        let mut uninit = unsafe { Mat::<MaybeUninit<T>, N, N>::new_uninit() };
+        let mut uninit = Mat::<MaybeUninit<T>, N, N>::new_uninit();
         matrix_foreach_index!(x, y, {
             uninit.0[x][y].write(if x == y {
                 diagonal[x].clone()

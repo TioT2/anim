@@ -209,7 +209,7 @@ impl DeviceContext {
             return Ok(Some(index));
         }
 
-        return Ok(None);
+        Ok(None)
     }
 
     /// Pick physical device

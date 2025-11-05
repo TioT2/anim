@@ -52,18 +52,6 @@ fn main() {
             .as_secs()
     );
 
-    // let instance = {
-    //     let text = std::fs::read_to_string(".temp/rei.obj").unwrap();
-    //     let obj = anim::render::model_loader::parse(&text).unwrap();
-    //     let mesh = render.create_core_mesh(&obj.vertices, &obj.indices);
-
-    //     render.create_core_instance(mesh, anim::render::core::Material {
-    //         base_color: [0.30, 0.47, 0.80],
-    //         metallic: 0.0,
-    //         roughness: 0.0
-    //     })
-    // };
-
     let mut instances = {
         // Create mesh
         let text = std::fs::read_to_string(".temp/rei.obj").unwrap();
@@ -117,11 +105,8 @@ fn main() {
 
                     type WinEvent = sdl2::event::WindowEvent;
 
-                    match win_event {
-                        WinEvent::Close => {
-                            break 'main_loop
-                        }
-                        _ => {}
+                    if win_event == WinEvent::Close {
+                        break 'main_loop;
                     }
                 }
                 Event::KeyDown { scancode, .. } => 'key_event: {
@@ -130,7 +115,7 @@ fn main() {
                     };
 
                     if scancode == sdl2::keyboard::Scancode::R {
-                        if instances.len() == 0 {
+                        if instances.is_empty() {
                             break 'key_event;
                         }
 
@@ -160,7 +145,4 @@ fn main() {
         // Render next frame (literally)
         render.next_frame();
     }
-
-    // Instance **must be** disabled
-    // instance.disable();
 }

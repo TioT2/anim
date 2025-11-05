@@ -73,7 +73,7 @@ pub enum JsonParsingError {
 impl Json {
     fn parse_string(source: &str) -> Result<(String, &str), JsonParsingError> {
         let mut len = 0;
-        let mut chars = source.chars().map(|ch| { len += ch.len_utf8(); ch });
+        let mut chars = source.chars().inspect(|ch| len += ch.len_utf8());
 
         // First character must exist due to call contract
         chars.next().unwrap();
@@ -81,7 +81,7 @@ impl Json {
         let mut result = String::new();
         let mut is_escape = false;
 
-        while let Some(ch) = chars.next() {
+        for ch in chars {
             if is_escape {
                 let escaped = match ch {
                     '\"' => '\"',
@@ -115,7 +115,7 @@ impl Json {
     }
 
     fn parse_array(mut source: &str) -> Result<(Vec<Self>, &str), JsonParsingError> {
-        source = &source['['.len_utf8()..].trim_start();
+        source = source['['.len_utf8()..].trim_start();
         if source.starts_with(']') {
             return Ok((Vec::new(), &source[']'.len_utf8()..]))
         }
@@ -145,7 +145,7 @@ impl Json {
     }
 
     fn parse_object(mut source: &str) -> Result<(HashMap<String, Self>, &str), JsonParsingError> {
-        source = &source['{'.len_utf8()..].trim_start();
+        source = source['{'.len_utf8()..].trim_start();
         if source.starts_with('}') {
             return Ok((HashMap::new(), &source['}'.len_utf8()..]))
         }
@@ -217,105 +217,98 @@ impl Json {
         Self::parse_json(source).map(|v| v.0)
     }
 
-    /// Display json to some output buffer
-    ///
-    /// # Note
-    /// Bytes written to the `out` are contents of a UTF-8 string.
-    pub fn display(&self, out: &mut dyn std::io::Write, tab_size: usize) {
-        /// JSON formatter
-        struct JsonFormatter<'t> {
-            /// Size of the tab
-            tab_size: usize,
+    // /// Display json to some output buffer
+    // ///
+    // /// # Note
+    // /// Bytes written to the `out` are contents of a UTF-8 string.
+    // pub fn display<'t>(&self, out: &'t mut dyn std::io::Write, tab_size: usize) {
+    //     /// JSON formatter
+    //     struct JsonFormatter<'t> {
+    //         /// Size of the tab
+    //         tab_size: usize,
 
-            /// Output buffer
-            out: &'t mut dyn std::io::Write,
-        }
+    //         /// Output buffer
+    //         out: &'t mut dyn std::io::Write,
+    //     }
 
-        impl<'t> JsonFormatter<'t> {
-            fn write_indent(&mut self, amount: usize) -> Result<(), std::io::Error> {
-                write!(self.out, "{: <1$}}}", "", self.tab_size * amount)
-            }
+    //     impl<'t> JsonFormatter<'t> {
+    //         fn write_indent(&mut self, amount: usize) -> Result<(), std::io::Error> {
+    //             write!(self.out, "{: <1$}}}", "", self.tab_size * amount)
+    //         }
 
-            fn write_str(&mut self, str: &str) -> Result<(), std::io::Error> {
-                self.out.write(str.as_bytes()).map(|_| ())
-            }
+    //         fn write_str(&mut self, str: &str) -> Result<(), std::io::Error> {
+    //             self.out.write(str.as_bytes()).map(|_| ())
+    //         }
 
-            fn write_string(&mut self, str: &str) -> Result<(), std::io::Error> {
-                self.write_str("\"")?;
-                for ch in str.chars() {
-                    write!(self.out, "\\u{{{:X}}}", ch as u32)?;
-                }
-                self.write_str("\"")?;
+    //         fn write_string(&mut self, str: &str) -> Result<(), std::io::Error> {
+    //             self.write_str("\"")?;
+    //             for ch in str.chars() {
+    //                 write!(self.out, "\\u{{{:X}}}", ch as u32)?;
+    //             }
+    //             self.write_str("\"")?;
 
-                Ok(())
-            }
+    //             Ok(())
+    //         }
 
-            fn write_object_kv(&mut self, kv: (&String, &Json), depth: usize) -> Result<(), std::io::Error> {
-                self.write_string(kv.0)?;
-                self.write_str(": ")?;
-                self.write_json(kv.1, depth + 1)?;
+    //         fn write_object_kv(&mut self, kv: (&String, &Json), depth: usize) -> Result<(), std::io::Error> {
+    //             self.write_string(kv.0)?;
+    //             self.write_str(": ")?;
+    //             self.write_json(kv.1, depth + 1)?;
 
-                Ok(())
-            }
+    //             Ok(())
+    //         }
 
-            /// Write some iterated object
-            fn write_iterated<T>(
-                &mut self,
-                depth: usize,
-                first: char,
-                last: char,
-                mut iter: impl Iterator<Item = T>,
-                mut write_item: impl FnMut(&mut Self, T, usize) -> Result<(), std::io::Error>
-            ) -> Result<(), std::io::Error> {
-                let Some(i0) = iter.next() else {
-                    write!(self.out, "{}{}", first, last)?;
-                    return Ok(());
-                };
-                write!(self.out, "{}", first)?;
-                self.write_indent(depth + 1)?;
-                write_item(self, i0, depth)?;
+    //         /// Write some iterated object
+    //         fn write_iterated<T>(
+    //             &mut self,
+    //             depth: usize,
+    //             first: char,
+    //             last: char,
+    //             mut iter: impl Iterator<Item = T>,
+    //             mut write_item: impl FnMut(&mut Self, T, usize) -> Result<(), std::io::Error>
+    //         ) -> Result<(), std::io::Error> {
+    //             let Some(i0) = iter.next() else {
+    //                 write!(self.out, "{}{}", first, last)?;
+    //                 return Ok(());
+    //             };
+    //             write!(self.out, "{}", first)?;
+    //             self.write_indent(depth + 1)?;
+    //             write_item(self, i0, depth)?;
 
-                for i in iter {
-                    self.write_str(",\n")?;
-                    self.write_indent(depth + 1)?;
-                    write_item(self, i, depth)?;
-                }
+    //             for i in iter {
+    //                 self.write_str(",\n")?;
+    //                 self.write_indent(depth + 1)?;
+    //                 write_item(self, i, depth)?;
+    //             }
 
-                self.write_str("\n")?;
-                self.write_indent(depth)?;
-                write!(self.out, "{}", last)?;
+    //             self.write_str("\n")?;
+    //             self.write_indent(depth)?;
+    //             write!(self.out, "{}", last)?;
 
-                Ok(())
-            }
+    //             Ok(())
+    //         }
 
-            fn write_json(&mut self, json: &Json, depth: usize) -> Result<(), std::io::Error> {
-                match json {
-                    Json::String(str) => self.write_string(str.as_str())?,
-                    Json::Object(obj) => self.write_iterated(depth, '{', '}', obj.iter(), Self::write_object_kv)?,
-                    Json::Array(arr) => self.write_iterated(depth, '[', ']', arr.iter(), Self::write_json)?,
-                    Json::Boolean(bool) => self.write_str(if *bool { "true" } else { "false" })?,
-                    Json::Number(num) => write!(self.out, "{}", num)?,
-                    Json::Null => self.write_str("null")?,
-                }
+    //         fn write_json(&mut self, json: &Json, depth: usize) -> Result<(), std::io::Error> {
+    //             match json {
+    //                 Json::String(str) => self.write_string(str.as_str())?,
+    //                 Json::Object(obj) => self.write_iterated(depth, '{', '}', obj.iter(), Self::write_object_kv)?,
+    //                 Json::Array(arr) => self.write_iterated(depth, '[', ']', arr.iter(), Self::write_json)?,
+    //                 Json::Boolean(bool) => self.write_str(if *bool { "true" } else { "false" })?,
+    //                 Json::Number(num) => write!(self.out, "{}", num)?,
+    //                 Json::Null => self.write_str("null")?,
+    //             }
 
-                Ok(())
-            }
+    //             Ok(())
+    //         }
 
-            pub fn write(&mut self, json: &Json) -> Result<(), std::io::Error> {
-                self.write_json(json, 0)
-            }
-        }
+    //         pub fn write(&mut self, json: &Json) -> Result<(), std::io::Error> {
+    //             self.write_json(json, 0)
+    //         }
+    //     }
 
-        // Perform actual write
-        _ = JsonFormatter { out, tab_size }.write(self);
-    }
-
-    /// Convert json into formatted string
-    pub fn to_string(&self) -> String {
-        let mut data = Vec::new();
-        self.display(&mut data, 4);
-        unsafe { String::from_utf8_unchecked(data) }
-    }
+    //     // Perform actual write
+    //     _ = JsonFormatter { out, tab_size }.write(self);
+    // }
 
     /// Get self type
     pub const fn ty(&self) -> JsonType {
@@ -345,7 +338,7 @@ impl Json {
     /// Try to interpret self as object
     pub fn as_object(&self) -> Result<&HashMap<String, Self>, JsonItemTypeError> {
         match self {
-            Self::Object(obj) => Ok(&obj),
+            Self::Object(obj) => Ok(obj),
             _ => self.type_error(JsonType::Object),
         }
     }
@@ -380,5 +373,92 @@ impl Json {
             Self::Null => Ok(()),
             _ => self.type_error(JsonType::Null),
         }
+    }
+}
+
+impl std::fmt::Display for Json {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        /// JSON formatter
+        struct JsonFormatter<'g, 't> {
+            /// Size of the tab
+            tab_size: usize,
+
+            /// Output buffer
+            out: &'g mut std::fmt::Formatter<'t>,
+        }
+
+        impl<'g, 't> JsonFormatter<'g, 't> {
+            fn write_indent(&mut self, amount: usize) -> Result<(), std::fmt::Error> {
+                write!(self.out, "{: <1$}}}", "", self.tab_size * amount)
+            }
+
+            fn write_string(&mut self, str: &str) -> Result<(), std::fmt::Error> {
+                self.out.write_str("\"")?;
+                for ch in str.chars() {
+                    write!(self.out, "\\u{{{:X}}}", ch as u32)?;
+                }
+                self.out.write_str("\"")?;
+
+                Ok(())
+            }
+
+            fn write_object_kv(&mut self, kv: (&String, &Json), depth: usize) -> Result<(), std::fmt::Error> {
+                self.write_string(kv.0)?;
+                self.out.write_str(": ")?;
+                self.write_json(kv.1, depth + 1)?;
+
+                Ok(())
+            }
+
+            /// Write some iterated object
+            fn write_iterated<T>(
+                &mut self,
+                depth: usize,
+                first: char,
+                last: char,
+                mut iter: impl Iterator<Item = T>,
+                mut write_item: impl FnMut(&mut Self, T, usize) -> Result<(), std::fmt::Error>
+            ) -> Result<(), std::fmt::Error> {
+                let Some(i0) = iter.next() else {
+                    // write!(self.out, "{}{}", first, last)?;
+                    return Ok(());
+                };
+                write!(self.out, "{}", first)?;
+                self.write_indent(depth + 1)?;
+                write_item(self, i0, depth)?;
+
+                for i in iter {
+                    self.out.write_str(",\n")?;
+                    self.write_indent(depth + 1)?;
+                    write_item(self, i, depth)?;
+                }
+
+                self.out.write_str("\n")?;
+                self.write_indent(depth)?;
+                write!(self.out, "{}", last)?;
+
+                Ok(())
+            }
+
+            fn write_json(&mut self, json: &Json, depth: usize) -> Result<(), std::fmt::Error> {
+                match json {
+                    Json::String(str) => self.write_string(str.as_str())?,
+                    Json::Object(obj) => self.write_iterated(depth, '{', '}', obj.iter(), Self::write_object_kv)?,
+                    Json::Array(arr) => self.write_iterated(depth, '[', ']', arr.iter(), Self::write_json)?,
+                    Json::Boolean(bool) => self.out.write_str(if *bool { "true" } else { "false" })?,
+                    Json::Number(num) => write!(self.out, "{}", num)?,
+                    Json::Null => self.out.write_str("null")?,
+                }
+
+                Ok(())
+            }
+
+            pub fn write(&mut self, json: &Json) -> Result<(), std::fmt::Error> {
+                self.write_json(json, 0)
+            }
+        }
+
+        // Perform actual write
+        JsonFormatter { out: f, tab_size: 4 }.write(self)
     }
 }

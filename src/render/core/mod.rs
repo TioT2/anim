@@ -16,7 +16,7 @@ use crate::{
     render::core::{
         device_context::DeviceContext,
         shader_compiler::{ShaderCompiler, ShaderCompilerError},
-        memory::{Allocator, FlushContext},
+        memory::{Allocator, Buffer, FlushContext},
         swapchain::{Swapchain, SwapchainHandle},
         util::DropGuard
     }
@@ -28,7 +28,7 @@ mod memory;
 mod swapchain;
 mod util;
 
-/// Standard vertex format
+/// Common vertex format
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct Vertex {
@@ -38,13 +38,13 @@ pub struct Vertex {
     /// Vertex texture coordinate
     pub tex_coord: math::Mat<f32, 2>,
 
-    /// Octmapped vertex normal (r16g16_snorm)
+    /// Octmapped vertex normal vector (r16g16_snorm)
     pub normal: u32,
 
-    /// Octmapped vertex tangent (r16g16_snorm)
+    /// Octmapped vertex tangent vector (r16g16_snorm)
     pub tangent: u32,
 
-    /// Misc data (bitangent sign, ...)
+    /// Misc data (bitangent vector sign, ...)
     pub misc: u32,
 }
 
@@ -85,12 +85,13 @@ impl Vertex {
     }
 }
 
-/// Protect vulkan object with guard with dc
+/// Protect vulkan object with guard
 macro_rules! vulkan_guard {
     ($v: expr, $dc: expr, $d: ident) => { DropGuard::new($v, |v| unsafe { $dc.device.$d(*v, None) }) };
 }
 
 /// Material descriptor
+#[derive(Copy, Clone)]
 pub struct Material {
     /// RGB color
     pub base_color: [f32; 3],
@@ -102,19 +103,26 @@ pub struct Material {
     pub roughness: f32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct InternalMaterial {
+    /// Base color texture id
+    pub base_color_texid: u32,
+
+    /// Metallic texture id
+    pub metallic_roughness_texid: u32,
+
+    /// Normal map texture id (maybe unused)
+    pub normal_map_texid: u32,
+}
+
 /// Mesh - structure that holds some vertex data
 pub struct Mesh {
-    /// Allocator reference
-    allocator: Arc<Allocator>,
+    /// Mesh bufffer
+    buffer: Arc<Buffer>,
 
     /// Device context holder
     _dc: Arc<DeviceContext>,
-
-    /// Mesh memory allocation
-    buffer_allocation: vk_mem::Allocation,
-
-    /// Mesh bufffer
-    buffer: vk::Buffer,
 
     /// Vertex buffer memory region
     vertex_span: std::ops::Range<usize>,
@@ -124,12 +132,6 @@ pub struct Mesh {
 
     /// Count of the mesh indices
     index_count: usize,
-}
-
-impl Drop for Mesh {
-    fn drop(&mut self) {
-        unsafe { self.allocator.destroy_buffer(self.buffer, &mut self.buffer_allocation) };
-    }
 }
 
 /// Arc structure that provides basic functions based on pointer on T (instead of T's value)
@@ -151,6 +153,7 @@ impl<T> std::hash::Hash for BlindArc<T> {
 }
 
 /// Structure that manages set of rendered objects
+#[derive(Default)]
 pub struct RenderSet {
     /// Render set internals
     data: RefCell<HashSet<BlindArc<Instance>>>,
@@ -159,9 +162,7 @@ pub struct RenderSet {
 impl RenderSet {
     /// Create new render set
     pub fn new() -> Self {
-        Self {
-            data: RefCell::new(HashSet::new()),
-        }
+        Self::default()
     }
 
     /// Manually insert item to the render set
@@ -178,7 +179,7 @@ impl RenderSet {
     pub fn snapshot(&self) -> Vec<Arc<Instance>> {
         self.data.borrow()
             .iter()
-            .map(|bweak| bweak.0.clone())
+            .map(|bref| bref.0.clone())
             .collect()
     }
 }
@@ -299,7 +300,7 @@ struct FramebufferImage {
     view: vk::ImageView,
 }
 
-/// Standalone framebuffer implementation
+/// Set of data used for single frame
 struct Framebuffer {
     /// Device context
     dc: Arc<DeviceContext>,
@@ -537,8 +538,27 @@ struct CameraBufferData {
     pub location: FVec,
 }
 
+/// Get bytes of structure
+fn bytes_of<T: Copy>(v: &T) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            (v as *const T) as *const u8,
+            std::mem::size_of::<T>()
+        )
+    }
+}
+
+/// Get bytes of slice
+fn bytes_of_slice<T: Copy>(v: &[T]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            v.as_ptr() as *const u8,
+            std::mem::size_of_val(v)
+        )
+    }
+}
+
 /// Structure that contains matrix buffer data
-#[derive(Default)]
 struct MatrixBuffer {
     /// Actual count of matrix buffer elements
     length: usize,
@@ -546,17 +566,11 @@ struct MatrixBuffer {
     /// Buffer (potential) capacity
     capacity: usize,
 
-    /// Host matrix buffer
-    host_buffer: vk::Buffer,
+    /// Host buffer (with allocation)
+    host_buffer: Arc<Buffer>,
 
-    /// Host matrix allocation
-    host_allocation: Option<vk_mem::Allocation>,
-
-    /// Device matrix buffer
-    device_buffer: vk::Buffer,
-
-    /// Device matrix allocation
-    device_allocation: Option<vk_mem::Allocation>,
+    /// Device buffer (with allocation)
+    device_buffer: Arc<Buffer>,
 }
 
 /// In-flight frame representation
@@ -576,20 +590,17 @@ struct FrameContext {
     /// Command buffer used for frame commands
     command_buffer: vk::CommandBuffer,
 
-    /// Frame buffer storage (option becase of it's laziness nature)
+    /// Frame buffer storage (option becase of it's laziness)
     framebuffer: Option<Framebuffer>,
 
     /// Context of the allocator operations
     flush_context: Option<FlushContext>,
 
-    /// Buffer that contains data for matrix computation (why it's even a structure?)
+    /// Buffer that contains data for matrix computation (kind of vector, if you think...)
     matrix_buffer: MatrixBuffer,
 
     /// Camera buffer
-    camera_buffer: vk::Buffer,
-
-    /// Allocation that holds camera buffer
-    camera_buffer_allocation: vk_mem::Allocation,
+    camera_buffer: Arc<Buffer>,
 
     /// Pool for matrix and render descriptor set allocation
     frame_descriptor_pool: vk::DescriptorPool,
@@ -1155,10 +1166,7 @@ impl Core {
                 ..Default::default()
             };
 
-            DropGuard::new(
-                unsafe { self.allocator.create_buffer(&create_info, &alloc_info) }?,
-                |(b, a)| unsafe { self.allocator.destroy_buffer(*b, a) }
-            )
+            self.allocator.create_buffer(&create_info, &alloc_info)?
         };
 
         let frame_descriptor_pool = {
@@ -1200,7 +1208,7 @@ impl Core {
         {
             let write_camera_buffer = |set, index| {
                 let camera_buffer_info = vk::DescriptorBufferInfo::default()
-                    .buffer(camera_buffer.0)
+                    .buffer(camera_buffer.handle())
                     .offset(0)
                     .range(std::mem::size_of::<CameraBufferData>() as vk::DeviceSize);
 
@@ -1221,7 +1229,7 @@ impl Core {
         // Write camera buffer to matrix descriptor set
         {
             let buffer_info = vk::DescriptorBufferInfo::default()
-                .buffer(camera_buffer.0)
+                .buffer(camera_buffer.handle())
                 .offset(0)
                 .range(std::mem::size_of::<CameraBufferData>() as vk::DeviceSize);
 
@@ -1246,11 +1254,15 @@ impl Core {
             render_finished_semaphore: render_finished_semaphore.into_inner(),
             transfer_finished_semaphore: transfer_finished_semaphore.into_inner(),
             framebuffer: None,
-            camera_buffer: camera_buffer.0,
-            camera_buffer_allocation: camera_buffer.into_inner().1,
-            matrix_buffer: MatrixBuffer::default(),
-            matrix_descriptor_set: matrix_descriptor_set,
-            render_descriptor_set: render_descriptor_set,
+            camera_buffer,
+            matrix_buffer: MatrixBuffer {
+                capacity: 0,
+                length: 0,
+                device_buffer: self.allocator.create_empty_buffer(),
+                host_buffer: self.allocator.create_empty_buffer(),
+            },
+            matrix_descriptor_set,
+            render_descriptor_set,
             frame_descriptor_pool: frame_descriptor_pool.into_inner(),
             render_set: Vec::new()
         })
@@ -1262,9 +1274,6 @@ impl Core {
 
             // Free matrix buffer
             _ = self.realloc_matrix_buffer(&mut frame.matrix_buffer, 0);
-
-            // Free camera buffer
-            self.allocator.destroy_buffer(frame.camera_buffer, &mut frame.camera_buffer_allocation);
 
             self.dc.device.free_command_buffers(
                 self.frame_command_pool,
@@ -1338,10 +1347,7 @@ impl Core {
                     ..Default::default()
                 };
 
-                DropGuard::new(
-                    unsafe { self.allocator.create_buffer(&host_buffer_info, &host_alloc_info)? },
-                    |(db, da)| unsafe { self.allocator.destroy_buffer(*db, da) }
-                )
+                self.allocator.create_buffer(&host_buffer_info, &host_alloc_info)?
             };
 
             let device = {
@@ -1356,10 +1362,7 @@ impl Core {
                     ..Default::default()
                 };
 
-                DropGuard::new(
-                    unsafe { self.allocator.create_buffer(&device_buffer_info, &device_alloc_info)? },
-                    |(db, da)| unsafe { self.allocator.destroy_buffer(*db, da) }
-                )
+                self.allocator.create_buffer(&device_buffer_info, &device_alloc_info)?
             };
 
             Some((host, device))
@@ -1367,30 +1370,13 @@ impl Core {
             None
         };
 
-        // Destroy old buffers
-        if let Some(host_allocation) = matrix_buffer.host_allocation.as_mut() {
-            unsafe { self.allocator.destroy_buffer(matrix_buffer.host_buffer, host_allocation) };
-        }
-        if let Some(device_allocation) = matrix_buffer.device_allocation.as_mut() {
-            unsafe { self.allocator.destroy_buffer(matrix_buffer.device_buffer, device_allocation) };
-        }
-
         // Set new buffers
         if let Some((host, device)) = new_host_device_buffers {
-            let host = host.into_inner();
-            let device = device.into_inner();
-
-            matrix_buffer.host_buffer = host.0;
-            matrix_buffer.host_allocation = Some(host.1);
-
-            matrix_buffer.device_buffer = device.0;
-            matrix_buffer.device_allocation = Some(device.1);
+            matrix_buffer.host_buffer = host;
+            matrix_buffer.device_buffer = device;
         } else {
-            matrix_buffer.host_buffer = vk::Buffer::null();
-            matrix_buffer.host_allocation = None;
-
-            matrix_buffer.device_buffer = vk::Buffer::null();
-            matrix_buffer.device_allocation = None;
+            matrix_buffer.host_buffer = self.allocator.create_empty_buffer();
+            matrix_buffer.device_buffer = self.allocator.create_empty_buffer();
         }
 
         matrix_buffer.capacity = capacity;
@@ -1428,11 +1414,12 @@ impl Core {
 
     /// Create new mesh
     pub fn create_mesh(&self, vertices: &[Vertex], indices: &[u32]) -> Result<Arc<Mesh>, vk::Result> {
-        let vt_buf_size = vertices.len() * std::mem::size_of::<Vertex>();
-        let ind_buf_size = indices.len() * std::mem::size_of::<u32>();
+        let vt_buf_size = std::mem::size_of_val(vertices);
+        let ind_buf_size = std::mem::size_of_val(indices);
 
-        let guarded_buffer_and_allocation = {
-            let create_info = vk::BufferCreateInfo::default()
+        // Construct vertex buffer
+        let buffer = self.allocator.create_buffer(
+            &vk::BufferCreateInfo::default()
                 .queue_family_indices(std::array::from_ref(&self.dc.queue_family_index))
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .size((vt_buf_size + ind_buf_size) as u64)
@@ -1440,41 +1427,21 @@ impl Core {
                     | vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::INDEX_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
-                );
-            let alloc_info = vk_mem::AllocationCreateInfo {
+                ),
+            &vk_mem::AllocationCreateInfo {
                 flags: vk_mem::AllocationCreateFlags::empty(),
                 usage: vk_mem::MemoryUsage::AutoPreferDevice,
                 ..Default::default()
-            };
+            },
+        )?;
 
-            DropGuard::new(
-                unsafe { self.allocator.create_buffer(&create_info, &alloc_info) }?,
-                |(buffer, allocation)| unsafe { self.allocator.destroy_buffer(*buffer, allocation) }
-            )
-        };
-        let (buffer, _) = &*guarded_buffer_and_allocation;
-
-        // Write vertex and index buffer data
-        unsafe {
-            self.allocator.write_buffer(
-                *buffer,
-                0,
-                std::slice::from_raw_parts(vertices.as_ptr() as *const u8, vt_buf_size)
-            )?;
-            self.allocator.write_buffer(
-                *buffer,
-                vt_buf_size,
-                std::slice::from_raw_parts(indices.as_ptr() as *const u8, ind_buf_size)
-            )?;
-        }
-
-        let (buffer, allocation) = guarded_buffer_and_allocation.into_inner();
+        // Write data of vertex and index buffers
+        buffer.write(0, bytes_of_slice(vertices))?;
+        buffer.write(vt_buf_size, bytes_of_slice(indices))?;
 
         Ok(Arc::new(Mesh {
+            buffer,
             _dc: self.dc.clone(),
-            allocator: self.allocator.clone(),
-            buffer_allocation: allocation,
-            buffer: buffer,
             vertex_span: 0..vt_buf_size,
             index_span: vt_buf_size..vt_buf_size + ind_buf_size,
             index_count: indices.len(),
@@ -1547,13 +1514,13 @@ impl Core {
                 unsafe {
                     self.dc.device.cmd_bind_vertex_buffers(
                         frame.command_buffer, 0,
-                        &[instance.mesh.buffer],
+                        &[instance.mesh.buffer.handle()],
                         &[instance.mesh.vertex_span.start as u64]
                     );
 
                     self.dc.device.cmd_bind_index_buffer(
                         frame.command_buffer,
-                        instance.mesh.buffer,
+                        instance.mesh.buffer.handle(),
                         instance.mesh.index_span.start as u64,
                         vk::IndexType::UINT32
                     );
@@ -1569,10 +1536,7 @@ impl Core {
                     self.render_pipeline_layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     0,
-                    std::slice::from_raw_parts(
-                        (&instance_index as *const u32) as *const u8,
-                        std::mem::size_of::<u32>()
-                    )
+                    bytes_of(&instance_index)
                 );
 
                 self.dc.device.cmd_draw_indexed(
@@ -1607,11 +1571,11 @@ impl Core {
                 ;
 
             let host_buffer_info = gen_buffer_info(
-                frame.matrix_buffer.host_buffer,
+                frame.matrix_buffer.host_buffer.handle(),
                 std::mem::size_of::<FMat>() * frame.matrix_buffer.capacity
             );
             let device_buffer_info = gen_buffer_info(
-                frame.matrix_buffer.device_buffer,
+                frame.matrix_buffer.device_buffer.handle(),
                 std::mem::size_of::<MatrixDeviceBufferItem>() * frame.matrix_buffer.capacity
             );
 
@@ -1639,12 +1603,8 @@ impl Core {
             }
         };
 
-        unsafe {
-            self.allocator.map_host_allocation(
-                &mut frame.matrix_buffer.host_allocation.unwrap(),
-                map_fn
-            )?;
-        }
+        // Map buffer by function
+        frame.matrix_buffer.host_buffer.host_map(map_fn)?;
 
         Ok(())
     }
@@ -1720,14 +1680,8 @@ impl Core {
                 location,
             };
 
-            unsafe {
-                let buffer_data = std::slice::from_raw_parts(
-                    (&camera_buffer_data as *const CameraBufferData) as *const u8,
-                    std::mem::size_of::<CameraBufferData>()
-                );
-
-                self.allocator.write_buffer(frame.camera_buffer, 0, buffer_data)?;
-            }
+            // Write camera buffer contents
+            frame.camera_buffer.write(0, bytes_of(&camera_buffer_data))?;
         }
 
         // Replace flush context with the new one
