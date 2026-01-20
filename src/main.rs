@@ -34,6 +34,7 @@ fn main() {
 
     let window = video
         .window("anim", 800, 600)
+        .resizable()
         .vulkan()
         .build()
         .unwrap();
@@ -104,6 +105,12 @@ fn main() {
                     }
 
                     type WinEvent = sdl2::event::WindowEvent;
+
+                    match win_event {
+                        WinEvent::Close => break 'main_loop,
+                        WinEvent::Resized(width, height) => render.notify_resize(width as u32, height as u32),
+                        _ => {}
+                    }
 
                     if win_event == WinEvent::Close {
                         break 'main_loop;

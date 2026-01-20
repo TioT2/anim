@@ -62,7 +62,7 @@ impl Drop for SwapchainHandle {
     }
 }
 
-/// Frame storage descriptor
+/// Output frame management structure
 pub struct Swapchain {
     /// Device context reference
     dc: Arc<DeviceContext>,
@@ -80,7 +80,10 @@ pub struct Swapchain {
     swapchain: Arc<SwapchainHandle>,
 
     /// If true, resize operation is requested.
-    resize_request: Cell<bool>,
+    resize_requested: Cell<bool>,
+
+    /// Extent used then there's no other sources
+    suggested_extent: Cell<vk::Extent2D>,
 }
 
 impl Swapchain {
@@ -130,7 +133,16 @@ impl Swapchain {
             )?
         };
 
-        // Get image count
+        let caps_extent_ok = true
+            && surface_caps.current_extent.width != !0
+            && surface_caps.current_extent.height != !0;
+
+        let image_extent = if caps_extent_ok {
+            surface_caps.current_extent
+        } else {
+            self.suggested_extent.get()
+        };
+
         let image_count = 3.clamp(
             surface_caps.min_image_count,
             if surface_caps.max_image_count == 0 { u32::MAX } else { surface_caps.max_image_count }
@@ -141,13 +153,13 @@ impl Swapchain {
             .min_image_count(image_count)
             .image_format(self.surface_format.format)
             .image_color_space(self.surface_format.color_space)
-            .image_extent(surface_caps.current_extent)
+            .image_extent(image_extent)
             .image_array_layers(1)
             .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .queue_family_indices(std::array::from_ref(&self.dc.queue_family_index))
             .pre_transform(surface_caps.current_transform)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::INHERIT)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(self.present_mode)
             .clipped(self.allow_image_clipping)
             .old_swapchain(**self.swapchain);
@@ -159,7 +171,7 @@ impl Swapchain {
             dc: self.dc.clone(),
             swapchain,
             revision,
-            extent: surface_caps.current_extent,
+            extent: image_extent,
             images: images.into_boxed_slice(),
         };
 
@@ -184,8 +196,22 @@ impl Swapchain {
             surface_format,
             present_mode,
             dc,
-            resize_request: Cell::new(true),
+            resize_requested: Cell::new(true),
+            suggested_extent: Cell::new(vk::Extent2D {
+                width: 800,
+                height: 600,
+            }),
         })
+    }
+
+    /// Notify swapchain about recommended resolution change
+    pub fn notify_resize(&self, width: u32, height: u32) {
+        let extent = vk::Extent2D { width, height };
+
+        if self.swapchain.extent != extent {
+            self.resize_requested.set(true);
+            self.suggested_extent.set(extent);
+        }
     }
 
     /// Acquire next image from swapchain
@@ -193,14 +219,13 @@ impl Swapchain {
         &mut self,
         semaphore: vk::Semaphore
     ) -> Result<(Arc<SwapchainHandle>, u32, bool), vk::Result> {
-        let resized = self.resize_request.get();
+        let resized = self.resize_requested.get();
 
         if resized {
-            // Recreate swapchain
             self.swapchain = unsafe { self.create_swapchain(self.swapchain.revision + 1) }?;
         }
 
-        let (image_index, resize_request) = unsafe {
+        let (image_index, resize_requested) = unsafe {
             self.dc.device_swapchain.acquire_next_image(
                 **self.swapchain,
                 u64::MAX,
@@ -208,14 +233,11 @@ impl Swapchain {
                 vk::Fence::null()
             )?
         };
-        // Set resize flag if required
-        self.resize_request.set(resize_request);
 
-        Ok((
-            self.swapchain.clone(),
-            image_index,
-            resized
-        ))
+        // Set resize flag if required
+        self.resize_requested.set(resize_requested);
+
+        Ok((self.swapchain.clone(), image_index, resized))
     }
 
     /// Get swapchain image set

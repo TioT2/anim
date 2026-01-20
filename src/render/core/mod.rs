@@ -1609,6 +1609,11 @@ impl Core {
         Ok(())
     }
 
+    /// Notify renderer about window resize
+    pub fn notify_resize(&self, width: u32, height: u32) {
+        self.swapchain.notify_resize(width, height);
+    }
+
     /// Render next frame
     pub fn render_frame(&mut self) -> Result<(), vk::Result> {
         let frame_acquired_semaphore = self.buffered_semaphore.get();

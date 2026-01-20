@@ -30,6 +30,11 @@ impl Render {
         Ok(Self { core })
     }
 
+    /// Notify renderer about resize
+    pub fn notify_resize(&self, width: u32, height: u32) {
+        self.core.borrow().notify_resize(width, height);
+    }
+
     /// Render next frame
     pub fn next_frame(&self) {
         self.core.borrow_mut().render_frame().unwrap();
