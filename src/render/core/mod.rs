@@ -1,6 +1,7 @@
 //! Render component that performs actual low-level rendering (manages meshes, materials, instances, etc.)
 
 use ash::vk;
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 // STD imports
 use std::{
@@ -12,13 +13,9 @@ use std::{
 
 // ANIM imports
 use crate::{
-    math::{self, FMat, FVec},
+        math::{Mat4f, Vec2f, Vec3f, Vec4f},
     render::core::{
-        device_context::DeviceContext,
-        shader_compiler::{ShaderCompiler, ShaderCompilerError},
-        memory::{Allocator, Buffer, FlushContext},
-        swapchain::{Swapchain, SwapchainHandle},
-        util::DropGuard
+        device_context::DeviceContext, memory::{Allocator, Buffer, FlushContext}, shader_compiler::{ShaderCompiler, ShaderCompilerError}, swapchain::{Swapchain, SwapchainHandle}, util::DropGuard
     }
 };
 
@@ -28,34 +25,19 @@ mod memory;
 mod swapchain;
 mod util;
 
-/// Common vertex format
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct Vertex {
-    /// Vertex position
-    pub position: math::Mat<f32, 3>,
+/// Manhattan-distance-unit vector compressed storage
+#[derive(Copy, Clone, FromBytes, IntoBytes, Immutable)]
+#[repr(transparent)]
+pub struct OctDir(pub u32);
 
-    /// Vertex texture coordinate
-    pub tex_coord: math::Mat<f32, 2>,
-
-    /// Octmapped vertex normal vector (r16g16_snorm)
-    pub normal: u32,
-
-    /// Octmapped vertex tangent vector (r16g16_snorm)
-    pub tangent: u32,
-
-    /// Misc data (bitangent vector sign, ...)
-    pub misc: u32,
-}
-
-impl Vertex {
-    /// Pack normal vector
-    pub fn pack_direction_octmap(dx: f32, dy: f32, dz: f32) -> u32 {
+impl OctDir {
+    /// Octmapped vector
+    pub fn pack(v: Vec3f) -> Self {
         // Calculate normalized (by manhattan distance) direction vector
-        let inv_length = (dx.abs() + dy.abs() + dz.abs()).recip();
-        let (mut x, mut y) = (dx * inv_length, dy * inv_length);
+        let inv_length = (v.x().abs() + v.y().abs() + v.z().abs()).recip();
+        let (mut x, mut y) = (v.x() * inv_length, v.y() * inv_length);
 
-        if dz.is_sign_negative() {
+        if v.z().is_sign_negative() {
             (x, y) = (
                 (1.0 - y.abs()) * x.signum(),
                 (1.0 - x.abs()) * y.signum()
@@ -67,22 +49,42 @@ impl Vertex {
             unsafe { (y * 32767.0).to_int_unchecked::<i16>() }.cast_unsigned() as u32,
         );
 
-        y << 16 | x
+        Self(y << 16 | x)
     }
 
-    /// Unpack normal vector
-    pub fn unpack_direction_octmap(packed: u32) -> (f32, f32, f32) {
+    /// Unpack octmapped vector
+    pub fn unpack(self) -> Vec3f {
         let (x, y) = (
-            ((packed & 0xFFFF) as u16).cast_signed(),
-            ((packed >> 16) as u16).cast_signed()
+            ((self.0 & 0xFFFF) as u16).cast_signed(),
+            ((self.0 >> 16) as u16).cast_signed()
         );
 
         let (x, y) = ((x as f32) / 32767.0, (y as f32) / 32767.0);
         let z = 1.0 - x.abs() - y.abs();
         let t = (-z).clamp(0.0, 1.0);
 
-        (x - x.copysign(t), y - y.copysign(t), z)
+        Vec3f::new(x - x.copysign(t), y - y.copysign(t), z)
     }
+}
+
+/// Common vertex format
+#[repr(C)]
+#[derive(Copy, Clone, Immutable, FromBytes, IntoBytes)]
+pub struct Vertex {
+    /// Vertex position
+    pub position: Vec3f,
+
+    /// Vertex texture coordinate
+    pub tex_coord: Vec2f,
+
+    /// Octmapped vertex normal vector (r16g16_snorm)
+    pub normal: OctDir,
+
+    /// Octmapped vertex tangent vector (r16g16_snorm)
+    pub tangent: OctDir,
+
+    /// Misc data (bitangent vector sign, ...)
+    pub misc: u32,
 }
 
 /// Protect vulkan object with guard
@@ -190,7 +192,7 @@ pub struct Instance {
     mesh: Arc<Mesh>,
 
     /// Instance transformation matrix
-    transform: Cell<math::FMat>,
+    transform: Cell<Mat4f>,
 
     /// Render set (weak) reference
     render_set: std::sync::Weak<RenderSet>,
@@ -201,12 +203,12 @@ pub struct Instance {
 
 impl Instance {
     /// Set transform matrix of the mesh instance
-    pub fn set_transform(&self, transform: math::FMat) {
+    pub fn set_transform(&self, transform: Mat4f) {
         self.transform.set(transform);
     }
 
     /// Get transform matrix of the mesh instance
-    pub fn get_transform(&self) -> math::FMat {
+    pub fn get_transform(&self) -> Mat4f {
         self.transform.get()
     }
 
@@ -229,10 +231,10 @@ impl Instance {
 
 /// Vulkan-compatible surface
 pub trait WindowContext {
-    /// Enumerate required instance extensions
+    /// Get required window extensions
     fn get_instance_extensions(&self) -> Result<Vec<CString>, String>;
 
-    /// Create surface from VkInstance value
+    /// Create surface from vkinstance raw value
     fn create_surface(&self, instance: usize) -> Result<usize, String>;
 }
 
@@ -500,62 +502,42 @@ impl Drop for Framebuffer {
 
 /// Item of the device matrix buffer
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, IntoBytes)]
 struct MatrixDeviceBufferItem {
     /// World matirx
-    pub world: FMat,
+    pub world: Mat4f,
 
     /// World-view-projection matrix
-    pub world_view_projection: FMat,
+    pub world_view_projection: Mat4f,
 
-    /// Inverse world matrix (3x3)
-    pub world_inverse: math::Mat<f32, 3, 4>,
+    /// Inverse world matrix (3x3, actually)
+    pub world_inverse: Mat4f,
 }
 
 /// Uniform buffer that holds camera buffer data
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Immutable, IntoBytes)]
 struct CameraBufferData {
     /// View-projection matirx
-    pub view_projection: FMat,
+    pub view_projection: Mat4f,
 
     /// View matrix
-    pub view: FMat,
+    pub view: Mat4f,
 
     /// Projection matrix
-    pub projection: FMat,
+    pub projection: Mat4f,
 
     /// Forward camera direction
-    pub dir_forward: FVec,
+    pub dir_forward: Vec4f,
 
     /// Right camera direction
-    pub dir_right: FVec,
+    pub dir_right: Vec4f,
 
     /// Up camera direction
-    pub dir_up: FVec,
+    pub dir_up: Vec4f,
 
     /// Camera location
-    pub location: FVec,
-}
-
-/// Get bytes of structure
-fn bytes_of<T: Copy>(v: &T) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            (v as *const T) as *const u8,
-            std::mem::size_of::<T>()
-        )
-    }
-}
-
-/// Get bytes of slice
-fn bytes_of_slice<T: Copy>(v: &[T]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            v.as_ptr() as *const u8,
-            std::mem::size_of_val(v)
-        )
-    }
+    pub location: Vec4f,
 }
 
 /// Structure that contains matrix buffer data
@@ -1337,7 +1319,7 @@ impl Core {
             let host = {
                 let host_buffer_info = vk::BufferCreateInfo::default()
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .size((std::mem::size_of::<FMat>() * capacity) as u64)
+                    .size((std::mem::size_of::<Mat4f>() * capacity) as u64)
                     .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
                     ;
                 let host_alloc_info = vk_mem::AllocationCreateInfo {
@@ -1436,8 +1418,8 @@ impl Core {
         )?;
 
         // Write data of vertex and index buffers
-        buffer.write(0, bytes_of_slice(vertices))?;
-        buffer.write(vt_buf_size, bytes_of_slice(indices))?;
+        buffer.write(0, vertices.as_bytes())?;
+        buffer.write(vt_buf_size, indices.as_bytes())?;
 
         Ok(Arc::new(Mesh {
             buffer,
@@ -1454,7 +1436,7 @@ impl Core {
             mesh,
             _material: material,
             render_set: Arc::downgrade(&self.render_set),
-            transform: Cell::new(math::FMat::identity()),
+            transform: Cell::new(Mat4f::identity()),
         }))
     }
 
@@ -1536,7 +1518,7 @@ impl Core {
                     self.render_pipeline_layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     0,
-                    bytes_of(&instance_index)
+                    instance_index.as_bytes(),
                 );
 
                 self.dc.device.cmd_draw_indexed(
@@ -1572,7 +1554,7 @@ impl Core {
 
             let host_buffer_info = gen_buffer_info(
                 frame.matrix_buffer.host_buffer.handle(),
-                std::mem::size_of::<FMat>() * frame.matrix_buffer.capacity
+                std::mem::size_of::<Mat4f>() * frame.matrix_buffer.capacity
             );
             let device_buffer_info = gen_buffer_info(
                 frame.matrix_buffer.device_buffer.handle(),
@@ -1596,7 +1578,7 @@ impl Core {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         instance.transform.as_ptr(),
-                        (data.as_mut_ptr() as *mut FMat).add(index),
+                        (data.as_mut_ptr() as *mut Mat4f).add(index),
                         1
                     );
                 }
@@ -1658,35 +1640,22 @@ impl Core {
 
         // Write frame camera buffer
         {
-            let location = FVec::new3(4.0, 4.0, 4.0);
-            let at = FVec::new3(0.0, 0.0, 0.0);
-            let view = FMat::view(location, at, FVec::new3(0.0, 1.0, 0.0));
-            let projection = FMat::projection_frustum_invz(-1.0, 1.0, -1.0, 1.0, 1.0);
+            let location = Vec3f::new(4.0, 4.0, 4.0);
+            let view = Mat4f::view(location, Vec3f::new(-1.0, -1.0, -1.0), Vec3f::new(0.0, 1.0, 0.0));
+            let projection = Mat4f::projection_frustum_inf_far(-1.0, 1.0, -1.0, 1.0, 1.0);
 
             let camera_buffer_data = CameraBufferData {
-                view_projection: FMat::mul(&projection, &view),
+                view_projection: projection * view,
                 view,
                 projection,
-                dir_forward: FVec::new3(
-                    -view.data[2][0],
-                    -view.data[2][1],
-                    -view.data[2][2],
-                ),
-                dir_right: FVec::new3(
-                    view.data[0][0],
-                    view.data[0][1],
-                    view.data[0][2],
-                ),
-                dir_up: FVec::new3(
-                    view.data[1][0],
-                    view.data[1][1],
-                    view.data[1][2],
-                ),
-                location,
+                dir_forward: -Vec4f::new(view.data[0][2], view.data[1][2], view.data[2][2], 0.0),
+                dir_right:    Vec4f::new(view.data[0][0], view.data[1][0], view.data[2][0], 0.0),
+                dir_up:       Vec4f::new(view.data[0][1], view.data[1][1], view.data[2][1], 0.0),
+                location: location.extend(0.0),
             };
 
             // Write camera buffer contents
-            frame.camera_buffer.write(0, bytes_of(&camera_buffer_data))?;
+            frame.camera_buffer.write(0, camera_buffer_data.as_bytes())?;
         }
 
         // Replace flush context with the new one

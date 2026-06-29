@@ -50,6 +50,9 @@ namespace anim {
 
         /// Inversed and stripped world matrix
         float3x3 world_inverse;
+
+        /// Some additional data
+        float4 meta;
     };
 
     /// Common vertex structure

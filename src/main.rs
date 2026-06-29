@@ -1,6 +1,6 @@
 use std::{ffi::CString, sync::Arc};
 
-use anim::{math::{FMat, FVec}, render::core::Material};
+use anim::{math::{Mat4f, Vec3f}, render::core::Material};
 
 /// Window newtype to implement render function
 pub struct WindowContext(Arc<sdl2::video::Window>);
@@ -55,7 +55,7 @@ fn main() {
 
     let mut instances = {
         // Create mesh
-        let text = std::fs::read_to_string(".temp/rei.obj").unwrap();
+        let text = std::fs::read_to_string("local/rei.obj").unwrap();
         let obj = anim::render::model_loader::parse(&text).unwrap();
         let mesh = render.create_core_mesh(&obj.vertices, &obj.indices);
 
@@ -79,7 +79,7 @@ fn main() {
                 metallic: 0.2,
                 roughness: 0.8
             });
-            instance.set_transform(FMat::translate(FVec::new3(
+            instance.set_transform(Mat4f::translate(Vec3f::new(
                 -x as f32 * 1.0,
                 -y as f32 * 1.0,
                 -z as f32 * 1.0,

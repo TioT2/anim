@@ -1,7 +1,7 @@
 //! Model loader implementation file
 
 use std::collections::HashMap;
-use crate::{math, render::core::Vertex};
+use crate::{math::{Vec2f, Vec3f}, render::core::{OctDir, Vertex}};
 
 /// Face component kind
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -108,9 +108,9 @@ pub struct ObjMesh {
 
 /// Parse .obj file
 pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
-    let mut positions = vec![math::vector![0.0f32, 0.0, 0.0]];
-    let mut normals = vec![0u32];
-    let mut tex_coords = vec![math::vector![0.0f32, 0.0]];
+    let mut positions = vec![Vec3f::new(0.0, 0.0, 0.0)];
+    let mut normals = vec![OctDir(0)];
+    let mut tex_coords = vec![Vec2f::new(0.0, 0.0)];
 
     let mut vertex_map = HashMap::<(u32, u32, u32), u32>::new();
 
@@ -152,7 +152,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
                     Err(error) => return Err(ParsingError::FloatParsingError { line_number, error }),
                 };
 
-                positions.push(math::vector![x, y, z]);
+                positions.push(Vec3f::new(x, y, z));
             }
 
             // Texture coordinates
@@ -174,7 +174,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
                     Err(error) => return Err(ParsingError::FloatParsingError { line_number, error }),
                 };
 
-                tex_coords.push(math::vector![x, y]);
+                tex_coords.push(Vec2f::new(x, y));
             }
 
             // Normal
@@ -199,8 +199,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
                 };
 
                 // Normalized input normal and pack it in octmap
-                let packed = Vertex::pack_direction_octmap(x, y, z);
-                normals.push(packed);
+                normals.push(OctDir::pack(Vec3f::new(x, y, z)));
             }
 
             // Face
@@ -242,7 +241,7 @@ pub fn parse(str: &str) -> Result<ObjMesh, ParsingError> {
                                         pool_len: normals.len() as u32,
                                         index: ni,
                                     })?,
-                                tangent: 0,
+                                tangent: OctDir(0),
                                 misc: 0,
                             });
 
